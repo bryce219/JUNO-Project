@@ -46,7 +46,7 @@ Continentalness and erosion, at those 81 points again, using the two lowest octa
 
 ## 5. The cascade
 
-This is where the actual biomes get read. The cascade looks at a seed on finer and finer grids: level $\ell$ uses every $2^{8-\ell}$th cell in each direction, starting with an $8 \times 8$ grid at level 1 and ending with all $1024 \times 1024$ cells at level 8. A level never redoes a cell from an earlier level. So a seed that makes it all the way through only costs one full scan. (An earlier version started with 16 cells. Starting at 64 was faster.)
+This is where the actual biomes get read. The cascade looks at a seed on finer and finer grids: level $\ell$ uses one cell out of every $2^{8-\ell}$ in each direction, starting with an $8 \times 8$ grid at level 1 and ending with all $1024 \times 1024$ cells at level 8. A level never redoes a cell from an earlier level. So a seed that makes it all the way through only costs one full scan. (An earlier version started with 16 cells. Starting at 64 was faster.)
 
 Between levels the seed gets checked, and what gets checked depends on the level.
 
