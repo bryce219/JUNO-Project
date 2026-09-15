@@ -1,0 +1,9 @@
+/results/
+
+# Build outputs
+/cuda/scan
+/cuda/genlut
+/cuda/*.o
+/cuda/lut263.bin
+/cuda/lut263.h
+/cuda/arch.txt
