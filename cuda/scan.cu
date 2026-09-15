@@ -1964,8 +1964,7 @@ static bool scoreSeeds(const std::vector<const char *> &words) {
         }
         for (size_t i = 0; i < scores.size(); i++) {
             CpuScores seedScores = scores[i].get();
-            printf("Seed %lld  SENTS %.9f  ARBITRATIONS %.6f  biomes %d/%d\n", (long long) seeds[first + i], seedScores.sents,
-                   seedScores.arbitrations, BIOME_COUNT - seedScores.missing, BIOME_COUNT);
+            printf("Seed %lld  SENTS %.9f  ARBITRATIONS %.6f\n", (long long) seeds[first + i], seedScores.sents, seedScores.arbitrations);
             fflush(stdout);
         }
     }
