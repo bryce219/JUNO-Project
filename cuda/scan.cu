@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <future> // std::async
 #include <chrono>
+#include <ctime>
 #include <cstring>
 #include <utility>
 #include <thread>
@@ -1286,10 +1287,17 @@ static void saveCheckedHits(ScanResults &results, const Settings &settings, bool
         }
 
         if (scores.sents >= settings.minSents && scores.arbitrations >= settings.minArbitrations) {
+            // when the hit got saved, in UTC
+            char foundTime[32];
+            time_t now = time(NULL);
+            struct tm utc;
+            gmtime_r(&now, &utc);
+            strftime(foundTime, sizeof(foundTime), "%Y-%m-%dT%H:%M:%SZ", &utc);
+
             int written = fprintf(hitsFile, "{\"seed\": %lld, \"sents\": %.9f, \"arbitrations\": %.9f, "
                                             "\"missing\": %d, \"mc\": \"26.3\", \"side\": 4096, "
-                                            "\"y\": 256, \"src\": \"gpu\", \"finder\": \"JUNO v%s\", \"cpu_verified\": %s}\n",
-                                  seed, scores.sents, scores.arbitrations, pending[i].missing, JUNO_VERSION, verified ? "true" : "false");
+                                            "\"y\": 256, \"src\": \"gpu\", \"finder\": \"JUNO v%s\", \"cpu_verified\": %s, \"found\": \"%s\"}\n",
+                                  seed, scores.sents, scores.arbitrations, pending[i].missing, JUNO_VERSION, verified ? "true" : "false", foundTime);
             if (written < 0 || fflush(hitsFile) != 0) {
                 fprintf(stderr, "Couldn't write seed %lld to the hits file, stopping without saving the checkpoint!\n", seed);
                 exit(1);

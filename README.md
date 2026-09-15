@@ -211,10 +211,10 @@ IMPORTANT NOTE: JUNO doesn't start when your computer boots, so run `make run` a
 Each hit is one JSON line:
 
 ```json
-{"seed": 3549742502234867244, "sents": 0.910265368, "arbitrations": 82.850095608, "missing": 0, "mc": "26.3", "side": 4096, "y": 256, "src": "gpu", "finder": "JUNO v1.0", "cpu_verified": true}
+{"seed": 3549742502234867244, "sents": 0.910265368, "arbitrations": 82.850095608, "missing": 0, "mc": "26.3", "side": 4096, "y": 256, "src": "gpu", "finder": "JUNO v1.0", "cpu_verified": true, "found": "2026-09-15T09:08:40Z"}
 ```
 
-`seed` is the number you'd type into Minecraft (it can be negative). `sents` is the SENTS score from the CPU check and `arbitrations` is the ARBITRATIONS score (defined [above](#arbitrations)). `cpu_verified` says whether or not the GPU and the CPU agreed on the score. The rest (`missing`, `mc`, `side`, `y`, `src`, `finder`) don't change from hit to hit in v1.0. `missing` is how many biomes the GPU didn't find, so it's always 0 on a saved hit.
+`seed` is the number you'd type into Minecraft (it can be negative). `sents` is the SENTS score from the CPU check and `arbitrations` is the ARBITRATIONS score (defined [above](#arbitrations)). `cpu_verified` says whether or not the GPU and the CPU agreed on the score, and `found` is the date and time the hit got saved (in UTC). The rest (`missing`, `mc`, `side`, `y`, `src`, `finder`) don't change from hit to hit in v1.0. `missing` is how many biomes the GPU didn't find, so it's always 0 on a saved hit.
 
 ## Known issues
 - If the scanner gets killed instead of stopped (`kill -9`, a crash or a power cut), the indexes after the last checkpoint get scanned again next time, so hits from that stretch can show up twice in the hits file. Nothing gets skipped though: the checkpoint never moves past a hit that's still in its CPU check.
