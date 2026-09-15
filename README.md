@@ -50,7 +50,7 @@ For a set of $N$ biomes, where $p_i$ is the fraction of the area that biome $i$ 
 
 ```math
 \mathrm{SENTS} = \begin{cases}
-0 & \text{if any of the } N \text{ biomes is missing} \\
+0 & \text{if any of the } N \text{ biomes are missing} \\
 -\dfrac{1}{\log N} \displaystyle\sum_{i=1}^{N} p_i \log p_i & \text{otherwise}
 \end{cases}
 ```
