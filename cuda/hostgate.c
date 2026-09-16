@@ -282,17 +282,237 @@ size_t gateIndexes(double threshold, uint64_t firstIndex, size_t indexCount, uin
     return passCount;
 }
 
-int gateUsesAvx512(void) {
-    return 1;
+
+int gateLanes(void) {
+    return 8;
+}
+
+// AVX2 version of the gate, it does 4 seeds at a time
+#elif defined(__AVX2__)
+#include <immintrin.h>
+
+// 4 random generators side by side
+typedef struct {
+    __m256i low;
+    __m256i high;
+} RandomVectors;
+
+// AVX2 has no rotate, so it takes a pair of shifts
+static inline __m256i rotateLeft(__m256i value, int bits) {
+    return _mm256_or_si256(_mm256_slli_epi64(value, bits), _mm256_srli_epi64(value, 64 - bits));
+}
+
+// No whole multiply either, so this builds one out of the halves
+static inline __m256i multiplyLow(__m256i a, __m256i b) {
+    __m256i aHigh = _mm256_srli_epi64(a, 32);
+    __m256i bHigh = _mm256_srli_epi64(b, 32);
+    __m256i lowProduct = _mm256_mul_epu32(a, b);
+    __m256i cross = _mm256_add_epi64(_mm256_mul_epu32(a, bHigh), _mm256_mul_epu32(aHigh, b));
+    return _mm256_add_epi64(lowProduct, _mm256_slli_epi64(cross, 32));
+}
+
+// xNextLong for all 4
+static inline __m256i nextLongs(RandomVectors *random) {
+    __m256i low = random->low;
+    __m256i high = random->high;
+    __m256i result = _mm256_add_epi64(rotateLeft(_mm256_add_epi64(low, high), 17), low);
+
+    high = _mm256_xor_si256(high, low);
+    random->low = _mm256_xor_si256(_mm256_xor_si256(rotateLeft(low, 49), high), _mm256_slli_epi64(high, 21));
+    random->high = rotateLeft(high, 28);
+    return result;
+}
+
+// Mixes the bits like streamSeed and xSetSeed do
+static inline __m256i mixBits(__m256i value, uint64_t firstMultiplier, uint64_t secondMultiplier) {
+    value = multiplyLow(_mm256_xor_si256(value, _mm256_srli_epi64(value, 30)), _mm256_set1_epi64x((long long) firstMultiplier));
+    value = multiplyLow(_mm256_xor_si256(value, _mm256_srli_epi64(value, 27)), _mm256_set1_epi64x((long long) secondMultiplier));
+    return _mm256_xor_si256(value, _mm256_srli_epi64(value, 31));
+}
+
+// How far the y offset fraction is from a half. The top bits go to a double through an int
+static inline __m256d distanceFromHalf(__m256i randomLongs) {
+    __m256i fractionBits = _mm256_and_si256(_mm256_srli_epi64(randomLongs, 32), _mm256_set1_epi64x(0xFFFFFF));
+    __m128i packed = _mm256_castsi256_si128(
+        _mm256_permutevar8x32_epi32(fractionBits, _mm256_setr_epi32(0, 2, 4, 6, 0, 0, 0, 0)));
+    __m256d distance = _mm256_sub_pd(_mm256_mul_pd(_mm256_cvtepi32_pd(packed), _mm256_set1_pd(0x1.0p-24)),
+                                     _mm256_set1_pd(0.5));
+    return _mm256_andnot_pd(_mm256_set1_pd(-0.0), distance);
+}
+
+// No compress either, so a permute stands in for it
+static void loadCompressMoves(__m256i moves[16]) {
+    for (int passed = 0; passed < 16; passed++) {
+        int32_t lanes[8] = {0};
+        int slot = 0;
+        for (int lane = 0; lane < 4; lane++) {
+            if (passed & (1 << lane)) {
+                lanes[slot++] = lane + lane;
+                lanes[slot++] = lane + lane + 1;
+            }
+        }
+        moves[passed] = _mm256_loadu_si256((const __m256i *) lanes);
+    }
+}
+
+static inline __m256i compressLongs(__m256i value, __m256i move) {
+    return _mm256_permutevar8x32_epi32(value, move);
+}
+
+static inline __m256d compressDoubles(__m256d value, __m256i move) {
+    return _mm256_castsi256_pd(compressLongs(_mm256_castpd_si256(value), move));
+}
+
+// Same as the AVX-512 seedRandoms, 4 at a time
+static inline void seedRandoms(__m256i indexes, __m256i *low, __m256i *high) {
+    __m256i mixed = multiplyLow(indexes, _mm256_set1_epi64x((long long) 0x9E3779B97F4A7C15ULL));
+    __m256i seeds = mixBits(mixed, 0xBF58476D1CE4E5B9ULL, 0x94D049BB133111EBULL);
+
+    __m256i stateLow = _mm256_xor_si256(seeds, _mm256_set1_epi64x((long long) 0x6a09e667f3bcc909ULL));
+    __m256i stateHigh = _mm256_add_epi64(stateLow, _mm256_set1_epi64x((long long) 0x9e3779b97f4a7c15ULL));
+    RandomVectors random = {mixBits(stateLow, 0xbf58476d1ce4e5b9ULL, 0x94d049bb133111ebULL),
+                            mixBits(stateHigh, 0xbf58476d1ce4e5b9ULL, 0x94d049bb133111ebULL)};
+
+    *low = nextLongs(&random);
+    *high = nextLongs(&random);
+}
+
+// Same as the AVX-512 addClimate, 4 at a time
+static inline __m256d addClimate(__m256d totals, int climate, __m256i low, __m256i high, const __m256d weights[3][2][2]) {
+    RandomVectors climateRandom = {_mm256_xor_si256(low, _mm256_set1_epi64x((long long) CLIMATE_SALTS[climate][0])),
+                                   _mm256_xor_si256(high, _mm256_set1_epi64x((long long) CLIMATE_SALTS[climate][1]))};
+    for (int half = 0; half < 2; half++) {
+        __m256i halfLow = nextLongs(&climateRandom);
+        __m256i halfHigh = nextLongs(&climateRandom);
+        for (int octave = 0; octave < 2; octave++) {
+            RandomVectors octaveRandom = {_mm256_xor_si256(halfLow, _mm256_set1_epi64x((long long) OCTAVE_SALTS[climate][octave][0])),
+                                          _mm256_xor_si256(halfHigh, _mm256_set1_epi64x((long long) OCTAVE_SALTS[climate][octave][1]))};
+            nextLongs(&octaveRandom); // skip the x offset
+            totals = _mm256_add_pd(totals, _mm256_mul_pd(weights[climate][half][octave], distanceFromHalf(nextLongs(&octaveRandom))));
+        }
+    }
+    return totals;
+}
+
+// Copies the weights into AVX2 vectors
+static void loadWeights(__m256d weights[3][2][2]) {
+    for (int climate = 0; climate < 3; climate++) {
+        for (int half = 0; half < 2; half++) {
+            for (int octave = 0; octave < 2; octave++) {
+                weights[climate][half][octave] = _mm256_set1_pd(GATE_WEIGHTS[climate][half][octave]);
+            }
+        }
+    }
+}
+
+#define QUEUE_SIZE 8192     // indexes that go through the gate together
+#define HUMIDITY_LIMIT 0.50 // The same cut the AVX-512 path takes, so the two agree
+
+// Runs the gate 4 indexes at a time, the same way the AVX-512 one runs 8
+size_t gateIndexes(double threshold, uint64_t firstIndex, size_t indexCount, uint64_t *output) {
+    const __m256i indexOffsets = _mm256_set_epi64x(3, 2, 1, 0);
+    const __m256d thresholds = _mm256_set1_pd(threshold);
+    const __m256d humidityThresholds = _mm256_set1_pd(threshold < HUMIDITY_LIMIT ? threshold : HUMIDITY_LIMIT);
+    __m256d weights[3][2][2];
+    __m256i moves[16];
+    loadWeights(weights);
+    loadCompressMoves(moves);
+
+    static __thread uint64_t queueIndexes[2][QUEUE_SIZE + 4];
+    static __thread uint64_t queueLows[2][QUEUE_SIZE + 4];
+    static __thread uint64_t queueHighs[2][QUEUE_SIZE + 4];
+    static __thread double queueTotals[2][QUEUE_SIZE + 4];
+
+    size_t passCount = 0;
+    size_t i = 0;
+    while (i < indexCount) {
+        size_t queued = 0;
+        size_t end = i + QUEUE_SIZE;
+        if (end > indexCount) {
+            end = indexCount;
+        }
+
+        // Humidity
+        for (; i + 4 <= end; i += 4) {
+            __m256i indexes = _mm256_add_epi64(_mm256_set1_epi64x((long long) (firstIndex + i)), indexOffsets);
+            __m256i low;
+            __m256i high;
+            seedRandoms(indexes, &low, &high);
+
+            __m256d totals = addClimate(_mm256_setzero_pd(), 0, low, high, weights);
+            int passed = _mm256_movemask_pd(_mm256_cmp_pd(totals, humidityThresholds, _CMP_LE_OQ));
+            if (passed) {
+                _mm256_storeu_si256((__m256i *) (queueIndexes[0] + queued), compressLongs(indexes, moves[passed]));
+                _mm256_storeu_si256((__m256i *) (queueLows[0] + queued), compressLongs(low, moves[passed]));
+                _mm256_storeu_si256((__m256i *) (queueHighs[0] + queued), compressLongs(high, moves[passed]));
+                _mm256_storeu_pd(queueTotals[0] + queued, compressDoubles(totals, moves[passed]));
+                queued += (size_t) __builtin_popcount((unsigned) passed);
+            }
+        }
+
+        // The last few indexes of the range go through one by one
+        uint64_t leftoverIndexes[4];
+        size_t leftoverCount = gateOneByOne(threshold, firstIndex + i, end - i, leftoverIndexes);
+        i = end;
+
+        // Erosion, then weirdness
+        for (int climate = 1; climate <= 2; climate++) {
+            int source = climate == 1 ? 0 : 1;
+            int destination = climate == 1 ? 1 : 0;
+
+            // Fill the rest of the last group of 4 with seeds that can't pass
+            for (size_t j = queued; j < ((queued + 3) & ~3UL); j++) {
+                queueIndexes[source][j] = 0;
+                queueLows[source][j] = 0;
+                queueHighs[source][j] = 0;
+                queueTotals[source][j] = 1e9;
+            }
+
+            size_t kept = 0;
+            for (size_t j = 0; j < queued; j += 4) {
+                __m256i indexes = _mm256_loadu_si256((const __m256i *) (queueIndexes[source] + j));
+                __m256i low = _mm256_loadu_si256((const __m256i *) (queueLows[source] + j));
+                __m256i high = _mm256_loadu_si256((const __m256i *) (queueHighs[source] + j));
+                __m256d totals = addClimate(_mm256_loadu_pd(queueTotals[source] + j), climate, low, high, weights);
+                int passed = _mm256_movemask_pd(_mm256_cmp_pd(totals, thresholds, _CMP_LE_OQ));
+                if (passed) {
+                    _mm256_storeu_si256((__m256i *) (queueIndexes[destination] + kept), compressLongs(indexes, moves[passed]));
+                    // weirdness still needs the random numbers and totals
+                    if (climate == 1) {
+                        _mm256_storeu_si256((__m256i *) (queueLows[destination] + kept), compressLongs(low, moves[passed]));
+                        _mm256_storeu_si256((__m256i *) (queueHighs[destination] + kept), compressLongs(high, moves[passed]));
+                        _mm256_storeu_pd(queueTotals[destination] + kept, compressDoubles(totals, moves[passed]));
+                    }
+                    kept += (size_t) __builtin_popcount((unsigned) passed);
+                }
+            }
+            queued = kept;
+        }
+
+        // The queue is in index order and the leftovers come after it, so the output stays in order
+        if (queued) {
+            memcpy(output + passCount, queueIndexes[0], queued * 8);
+            passCount += queued;
+        }
+        for (size_t j = 0; j < leftoverCount; j++) {
+            output[passCount++] = leftoverIndexes[j];
+        }
+    }
+    return passCount;
+}
+
+
+int gateLanes(void) {
+    return 4;
 }
 #else
-// Without AVX-512 the gate checks the indexes one by one, which is about 5 times slower on a thread.
-// TODO maybe an AVX2 version for these CPUs
+// Without AVX-512 or AVX2 the gate checks the indexes one by one
 size_t gateIndexes(double threshold, uint64_t firstIndex, size_t indexCount, uint64_t *output) {
     return gateOneByOne(threshold, firstIndex, indexCount, output);
 }
 
-int gateUsesAvx512(void) {
-    return 0;
+
+int gateLanes(void) {
+    return 1;
 }
 #endif

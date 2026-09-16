@@ -1248,6 +1248,7 @@ struct Settings {
     bool prepareOnly = false;           // Check the range and save the checkpoint, but don't scan (make run does this first)
     const char *customSeed = NULL;      // text that picks the stream, NULL if it wasn't given
     bool plainStream = false;           // Scan the plain stream without a custom seed
+    int gateThreads = 0;                // Threads for the CPU gate, 0 picks from the core count
 };
 
 // Best seed so far, plus the hits
@@ -1673,6 +1674,7 @@ static void printUsage() {
            "  --plain-stream               Scan the plain stream, without a custom seed\n"
            "  --min-sents <score>          The SENTS score a hit needs to get saved (%.3f if you leave it out)\n"
            "  --min-arbitrations <score>   The ARBITRATIONS score a hit needs to get saved\n"
+           "  --gate-threads <n>           Threads for the CPU gate (all but one or two of the cores if you leave it out)\n"
            "  --prepare                    Only check the range and save the checkpoint, without scanning (make run does this)\n",
            LOWEST_MIN_SENTS);
 }
@@ -1748,6 +1750,14 @@ static bool readOptions(int argc, char **argv, Settings &settings, std::vector<c
             if (!readScore(argc, argv, i, settings.minSents)) {
                 return false;
             }
+            i++;
+        } else if (strcmp(argv[i], "--gate-threads") == 0) {
+            unsigned long long threads = 0;
+            if (i + 1 >= argc || !readWholeNumber(argv[i + 1], threads) || threads < 1 || threads > 1024) {
+                printf("--gate-threads has to be a whole number from 1 to 1024.\n");
+                return false;
+            }
+            settings.gateThreads = (int) threads;
             i++;
         } else if (strcmp(argv[i], "--min-arbitrations") == 0) {
             if (!readScore(argc, argv, i, settings.minArbitrations)) {
@@ -2255,16 +2265,20 @@ int main(int argc, char **argv) {
     int slot = 0;
     StageTotals stageTotals;
 
-    // Leave two CPU threads for the GPU driver and the hit checks
-    int gateThreads = (int) std::thread::hardware_concurrency() - 2;
+    // Determine the number of threads to use for the CPU gate based on the hardware concurrency and user settings.
+    int cores = (int) std::thread::hardware_concurrency();
+    int gateThreads = settings.gateThreads > 0 ? settings.gateThreads
+                                               : cores - (cores >= 16 ? 2 : 1);
     if (gateThreads < 1) {
         gateThreads = 1;
     }
     GateProducer *gate = new GateProducer(offset + start + (uint64_t) finished, rangeSize - finished, gateThreads);
-    if (gateUsesAvx512()) {
+    if (gateLanes() == 8) {
         printf("Using %d threads for the CPU gate (with AVX-512)\n", gateThreads);
+    } else if (gateLanes() == 4) {
+        printf("Using %d threads for the CPU gate (with AVX2)\n", gateThreads);
     } else {
-        printf("Using %d threads for the CPU gate. This CPU doesn't have AVX-512, so the gate is a lot slower\n", gateThreads);
+        printf("Using %d threads for the CPU gate. This CPU has neither AVX-512 nor AVX2, so the gate is a lot slower\n", gateThreads);
     }
     fflush(stdout);
 
