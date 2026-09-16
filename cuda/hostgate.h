@@ -21,8 +21,8 @@ extern "C" {
  */
 size_t gateIndexes(double threshold, uint64_t firstIndex, size_t indexCount, uint64_t *output);
 
-// Returns 1 if the gate was built with AVX-512, 0 if it uses the slow version
-int gateUsesAvx512(void);
+// Seeds the gate checks at a time: 8 with AVX-512, 4 with AVX2, 1 without either
+int gateLanes(void);
 
 #ifdef __cplusplus
 }
