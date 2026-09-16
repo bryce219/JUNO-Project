@@ -2,6 +2,7 @@
 # make log runs this. It shows the new records as the scanner finds them, or with MIN_SENTS / MIN_ARBITRATIONS 
 # every new hit with a high enough score. Ctrl+C closes the log but the scan keeps going
 set -u
+export LC_ALL=C
 cd "$(dirname "$0")/.."
 MIN_SENTS=${MIN_SENTS-}
 MIN_ARBITRATIONS=${MIN_ARBITRATIONS-}
@@ -39,6 +40,7 @@ function now(    time) {
     close("date +%H:%M:%S")
     return time
 }
+BEGIN { bestSents = -1; bestArbitrations = -1 }
 /^==> .* <==$/ { file = $2; next }
 $0 == "" { next }
 file ~ /gpu_scan\.log$/ {

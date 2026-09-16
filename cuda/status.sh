@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # This is what make status runs. It prints what's running, the progress, the speed and the best hit 
 set -u
+export LC_ALL=C
 cd "$(dirname "$0")/.."
 PROJECT=$(pwd -P)
 . ./cuda/procs.sh
