@@ -1,5 +1,5 @@
 # JUNO
-JUNO (Just Use Noise Once) is a GPU seed finder for Minecraft 26.3 - it looks for the seeds with the most even mix of biomes around the world origin. This is release v1.0.
+JUNO (Just Use Noise Once) is a GPU seed finder for Minecraft 26.3 - it looks for the seeds with the most even mix of biomes around the world origin. This is release v1.1.
 
 ## Quick start
 ```sh
@@ -14,7 +14,7 @@ make stop     # stop searching, make run carries on from there next time
 
 ```
 $ make run
-JUNO v1.0
+JUNO v1.1
 There's no checkpoint yet, so this starts at index 0
 Picked a random custom seed and saved it to ../results/custom_seed.txt: h1OZIrYad5z9qGHL
 The custom seed moves the stream by 14890994237487958828
@@ -211,10 +211,10 @@ IMPORTANT NOTE: JUNO doesn't start when your computer boots, so run `make run` a
 Each hit is one JSON line:
 
 ```json
-{"seed": 3549742502234867244, "sents": 0.910265368, "arbitrations": 82.850095608, "missing": 0, "mc": "26.3", "side": 4096, "y": 256, "src": "gpu", "finder": "JUNO v1.0", "cpu_verified": true, "found": "2026-09-15T09:08:40Z"}
+{"seed": 3549742502234867244, "sents": 0.910265368, "arbitrations": 82.850095608, "missing": 0, "mc": "26.3", "side": 4096, "y": 256, "src": "gpu", "finder": "JUNO v1.1", "cpu_verified": true, "found": "2026-09-15T09:08:40Z"}
 ```
 
-`seed` is the number you'd type into Minecraft (it can be negative). `sents` is the SENTS score from the CPU check and `arbitrations` is the ARBITRATIONS score (defined [above](#arbitrations)). `cpu_verified` says whether or not the GPU and the CPU agreed on the score, and `found` is the date and time the hit got saved (in UTC). The rest (`missing`, `mc`, `side`, `y`, `src`, `finder`) don't change from hit to hit in v1.0. `missing` is how many biomes the GPU didn't find, so it's always 0 on a saved hit.
+`seed` is the number you'd type into Minecraft (it can be negative). `sents` is the SENTS score from the CPU check and `arbitrations` is the ARBITRATIONS score (defined [above](#arbitrations)). `cpu_verified` says whether or not the GPU and the CPU agreed on the score, and `found` is the date and time the hit got saved (in UTC). The rest (`missing`, `mc`, `side`, `y`, `src`, `finder`) don't change from hit to hit within a version. `missing` is how many biomes the GPU didn't find, so it's always 0 on a saved hit.
 
 ## Known issues
 - If the scanner gets killed instead of stopped (`kill -9`, a crash or a power cut), the indexes after the last checkpoint get scanned again next time, so hits from that stretch can show up twice in the hits file. Nothing gets skipped though: the checkpoint never moves past a hit that's still in its CPU check.

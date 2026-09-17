@@ -1,7 +1,7 @@
 // JUNO (Just Use Noise Once), a GPU seed scanner for Minecraft 26.3.
 // Seeds go through the CPU gate in hostgate.c first, then the temperature, humidity and probe kernels. The cascade kernel counts the biomes
 // for whatever is left, and the CPU checks the hits again at the end.
-#define JUNO_VERSION "1.0"
+#define JUNO_VERSION "1.1"
 #define BIOME_COUNT 52                   // surface biomes we score
 #define TEMPERATURE_THREADS 32           // Threads in a block for the temperature kernel
 #define STREAM_COUNT 5                   // Batches the GPU works on at once, each one gets a CUDA stream. Tried a few on my machine and 5 worked best
