@@ -21,6 +21,14 @@ extern "C" {
  */
 size_t gateIndexes(double threshold, uint64_t firstIndex, size_t indexCount, uint64_t *output);
 
+/**
+ * @brief Runs the gate in floats, the way the GPU gate does (for --cpu-assist). The rest works like gateIndexes
+ * 
+ * @param threshold The GPU gate's threshold (gpuGateThreshold in scan.cu)
+ * @param humidityThreshold The GPU gate's humidity cut (gpuGateHumidityThreshold)
+ */
+size_t floatGateIndexes(float threshold, float humidityThreshold, uint64_t firstIndex, size_t indexCount, uint64_t *output);
+
 // Seeds the gate checks at a time: 8 with AVX-512, 4 with AVX2, 1 without either
 int gateLanes(void);
 

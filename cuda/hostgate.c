@@ -3,6 +3,7 @@
 // are from a half (times a weight) and keep the seeds with a small total.
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <math.h>
 #include <string.h>
 #include "rng.h"
@@ -80,6 +81,66 @@ static size_t gateOneByOne(double threshold, uint64_t firstIndex, size_t indexCo
     size_t passCount = 0;
     for (size_t i = 0; i < indexCount; i++) {
         if (gateTotal(streamSeed(firstIndex + i)) <= threshold) {
+            output[passCount++] = firstIndex + i;
+        }
+    }
+    return passCount;
+}
+
+// GATE_WEIGHTS as floats, the way we have them on the GPU
+static const float FLOAT_GATE_WEIGHTS[3][2][2] = {
+    {{1.000f, 0.281f}, {0.984f, 0.202f}},  // Humidity
+    {{0.464f, 0.245f}, {0.486f, 0.193f}},  // Erosion
+    {{0.197f, 0.182f}, {0.209f, 0.198f}}}; // Weirdness
+
+/**
+ * @brief Returns the gate total for one climate value in floats, like gateClimate in gpu_gate.cuh
+ * 
+ * @param climate 0, 1 or 2 (humidity, erosion or weirdness)
+ * @param low The low random number of the seed
+ * @param high The high one
+ * @return float The total for this climate value
+ */
+static float floatClimateTotal(int climate, uint64_t low, uint64_t high) {
+    Xoroshiro climateRandom = {low ^ CLIMATE_SALTS[climate][0], high ^ CLIMATE_SALTS[climate][1]};
+    float total = 0.0f;
+    for (int half = 0; half < 2; half++) {
+        uint64_t halfLow = xNextLong(&climateRandom);
+        uint64_t halfHigh = xNextLong(&climateRandom);
+        for (int octave = 0; octave < 2; octave++) {
+            Xoroshiro octaveRandom = {halfLow ^ OCTAVE_SALTS[climate][octave][0], halfHigh ^ OCTAVE_SALTS[climate][octave][1]};
+            xNextLong(&octaveRandom); // Skip the x offset
+            int fraction = (int) ((uint32_t) (xNextLong(&octaveRandom) >> 32) & 0xFFFFFFu);
+            total = fmaf(FLOAT_GATE_WEIGHTS[climate][half][octave], (float) abs(fraction - 0x800000), total); // how far it is from a half, times 2^24
+        }
+    }
+    return total;
+}
+
+// true if the GPU gate keeps the seed, checked in gateKernel's order
+static int passesFloatGate(uint64_t seed, float threshold, float humidityThreshold) {
+    Xoroshiro seedRandom;
+    xSetSeed(&seedRandom, seed);
+    uint64_t low = xNextLong(&seedRandom);
+    uint64_t high = xNextLong(&seedRandom);
+
+    float total = floatClimateTotal(0, low, high);
+    if (!(total <= humidityThreshold)) {
+        return 0;
+    }
+    total += floatClimateTotal(1, low, high);
+    if (!(total <= threshold)) {
+        return 0;
+    }
+    total += floatClimateTotal(2, low, high);
+    return total <= threshold;
+}
+
+// gateOneByOne for the float gate
+static size_t floatGateOneByOne(float threshold, float humidityThreshold, uint64_t firstIndex, size_t indexCount, uint64_t *output) {
+    size_t passCount = 0;
+    for (size_t i = 0; i < indexCount; i++) {
+        if (passesFloatGate(streamSeed(firstIndex + i), threshold, humidityThreshold)) {
             output[passCount++] = firstIndex + i;
         }
     }
@@ -281,6 +342,133 @@ size_t gateIndexes(double threshold, uint64_t firstIndex, size_t indexCount, uin
     }
     return passCount;
 }
+
+
+#if defined(__AVX512VL__) && defined(__FMA__)
+// floatClimateTotal for 8 seeds
+static inline __m256 floatClimateTotals(int climate, __m512i low, __m512i high, const __m256 weights[3][2][2]) {
+    RandomVectors climateRandom = {_mm512_xor_si512(low, _mm512_set1_epi64((long long) CLIMATE_SALTS[climate][0])),
+                                   _mm512_xor_si512(high, _mm512_set1_epi64((long long) CLIMATE_SALTS[climate][1]))};
+    __m256 totals = _mm256_setzero_ps();
+    for (int half = 0; half < 2; half++) {
+        __m512i halfLow = nextLongs(&climateRandom);
+        __m512i halfHigh = nextLongs(&climateRandom);
+        for (int octave = 0; octave < 2; octave++) {
+            RandomVectors octaveRandom = {_mm512_xor_si512(halfLow, _mm512_set1_epi64((long long) OCTAVE_SALTS[climate][octave][0])),
+                                          _mm512_xor_si512(halfHigh, _mm512_set1_epi64((long long) OCTAVE_SALTS[climate][octave][1]))};
+            nextLongs(&octaveRandom); // skip the x offset
+            __m512i fractionBits = _mm512_and_si512(_mm512_srli_epi64(nextLongs(&octaveRandom), 32), _mm512_set1_epi64(0xFFFFFF));
+            __m256i distances = _mm256_abs_epi32(_mm256_sub_epi32(_mm512_cvtepi64_epi32(fractionBits), _mm256_set1_epi32(0x800000)));
+            totals = _mm256_fmadd_ps(weights[climate][half][octave], _mm256_cvtepi32_ps(distances), totals);
+        }
+    }
+    return totals;
+}
+
+/**
+ * @brief This method runs the float gate 8 indexes at a time, like gateIndexes
+ * 
+ * @param threshold The GPU gate's threshold
+ * @param humidityThreshold The GPU gate's humidity cut
+ */
+size_t floatGateIndexes(float threshold, float humidityThreshold, uint64_t firstIndex, size_t indexCount, uint64_t *output) {
+    const __m512i indexOffsets = _mm512_set_epi64(7, 6, 5, 4, 3, 2, 1, 0);
+    const __m256 thresholds = _mm256_set1_ps(threshold);
+    const __m256 humidityThresholds = _mm256_set1_ps(humidityThreshold);
+    __m256 weights[3][2][2];
+    for (int climate = 0; climate < 3; climate++) {
+        for (int half = 0; half < 2; half++) {
+            for (int octave = 0; octave < 2; octave++) {
+                weights[climate][half][octave] = _mm256_set1_ps(FLOAT_GATE_WEIGHTS[climate][half][octave]);
+            }
+        }
+    }
+
+    static __thread uint64_t queueIndexes[2][QUEUE_SIZE + 8];
+    static __thread uint64_t queueLows[2][QUEUE_SIZE + 8];
+    static __thread uint64_t queueHighs[2][QUEUE_SIZE + 8];
+    static __thread float queueTotals[2][QUEUE_SIZE + 8];
+
+    size_t passCount = 0;
+    size_t i = 0;
+    while (i < indexCount) {
+        size_t queued = 0;
+        size_t end = i + QUEUE_SIZE;
+        if (end > indexCount) {
+            end = indexCount;
+        }
+
+        // Humidity
+        for (; i + 8 <= end; i += 8) {
+            __m512i indexes = _mm512_add_epi64(_mm512_set1_epi64((long long) (firstIndex + i)), indexOffsets);
+            __m512i low;
+            __m512i high;
+            seedRandoms(indexes, &low, &high);
+
+            __m256 totals = floatClimateTotals(0, low, high, weights);
+            __mmask8 passed = _mm256_cmp_ps_mask(totals, humidityThresholds, _CMP_LE_OQ);
+            if (passed) {
+                _mm512_storeu_si512(queueIndexes[0] + queued, _mm512_maskz_compress_epi64(passed, indexes));
+                _mm512_storeu_si512(queueLows[0] + queued, _mm512_maskz_compress_epi64(passed, low));
+                _mm512_storeu_si512(queueHighs[0] + queued, _mm512_maskz_compress_epi64(passed, high));
+                _mm256_storeu_ps(queueTotals[0] + queued, _mm256_maskz_compress_ps(passed, totals));
+                queued += (size_t) __builtin_popcount(passed);
+            }
+        }
+
+        // The last few indexes of the range go through one by one
+        uint64_t leftoverIndexes[8];
+        size_t leftoverCount = floatGateOneByOne(threshold, humidityThreshold, firstIndex + i, end - i, leftoverIndexes);
+        i = end;
+
+        // Erosion, then weirdness
+        for (int climate = 1; climate <= 2; climate++) {
+            int source = climate == 1 ? 0 : 1;
+            int destination = climate == 1 ? 1 : 0;
+
+            // Fill the rest of the last group of 8 with seeds that can't pass
+            for (size_t j = queued; j < ((queued + 7) & ~7UL); j++) {
+                queueIndexes[source][j] = 0;
+                queueLows[source][j] = 0;
+                queueHighs[source][j] = 0;
+                queueTotals[source][j] = 1e9f;
+            }
+
+            size_t kept = 0;
+            for (size_t j = 0; j < queued; j += 8) {
+                __m512i indexes = _mm512_loadu_si512(queueIndexes[source] + j);
+                __m512i low = _mm512_loadu_si512(queueLows[source] + j);
+                __m512i high = _mm512_loadu_si512(queueHighs[source] + j);
+                __m256 totals = _mm256_add_ps(_mm256_loadu_ps(queueTotals[source] + j), floatClimateTotals(climate, low, high, weights));
+                __mmask8 passed = _mm256_cmp_ps_mask(totals, thresholds, _CMP_LE_OQ);
+                if (passed) {
+                    _mm512_storeu_si512(queueIndexes[destination] + kept, _mm512_maskz_compress_epi64(passed, indexes));
+                    if (climate == 1) {
+                        _mm512_storeu_si512(queueLows[destination] + kept, _mm512_maskz_compress_epi64(passed, low));
+                        _mm512_storeu_si512(queueHighs[destination] + kept, _mm512_maskz_compress_epi64(passed, high));
+                        _mm256_storeu_ps(queueTotals[destination] + kept, _mm256_maskz_compress_ps(passed, totals));
+                    }
+                    kept += (size_t) __builtin_popcount(passed);
+                }
+            }
+            queued = kept;
+        }
+
+        if (queued) {
+            memcpy(output + passCount, queueIndexes[0], queued * 8);
+            passCount += queued;
+        }
+        for (size_t j = 0; j < leftoverCount; j++) {
+            output[passCount++] = leftoverIndexes[j];
+        }
+    }
+    return passCount;
+}
+#else
+size_t floatGateIndexes(float threshold, float humidityThreshold, uint64_t firstIndex, size_t indexCount, uint64_t *output) {
+    return floatGateOneByOne(threshold, humidityThreshold, firstIndex, indexCount, output);
+}
+#endif
 
 
 int gateLanes(void) {
@@ -502,6 +690,142 @@ size_t gateIndexes(double threshold, uint64_t firstIndex, size_t indexCount, uin
 }
 
 
+#ifdef __FMA__
+// floatClimateTotal for 4 seeds
+static inline __m128 floatClimateTotals(int climate, __m256i low, __m256i high, const __m128 weights[3][2][2]) {
+    RandomVectors climateRandom = {_mm256_xor_si256(low, _mm256_set1_epi64x((long long) CLIMATE_SALTS[climate][0])),
+                                   _mm256_xor_si256(high, _mm256_set1_epi64x((long long) CLIMATE_SALTS[climate][1]))};
+    __m128 totals = _mm_setzero_ps();
+    for (int half = 0; half < 2; half++) {
+        __m256i halfLow = nextLongs(&climateRandom);
+        __m256i halfHigh = nextLongs(&climateRandom);
+        for (int octave = 0; octave < 2; octave++) {
+            RandomVectors octaveRandom = {_mm256_xor_si256(halfLow, _mm256_set1_epi64x((long long) OCTAVE_SALTS[climate][octave][0])),
+                                          _mm256_xor_si256(halfHigh, _mm256_set1_epi64x((long long) OCTAVE_SALTS[climate][octave][1]))};
+            nextLongs(&octaveRandom); // skip the x offset
+            __m256i fractionBits = _mm256_and_si256(_mm256_srli_epi64(nextLongs(&octaveRandom), 32), _mm256_set1_epi64x(0xFFFFFF));
+            __m128i fractions = _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(fractionBits, _mm256_setr_epi32(0, 2, 4, 6, 0, 0, 0, 0)));
+            __m128i distances = _mm_abs_epi32(_mm_sub_epi32(fractions, _mm_set1_epi32(0x800000)));
+            totals = _mm_fmadd_ps(weights[climate][half][octave], _mm_cvtepi32_ps(distances), totals);
+        }
+    }
+    return totals;
+}
+
+// Runs the float gate 4 indexes at a time, like the AVX-512 one runs 8
+size_t floatGateIndexes(float threshold, float humidityThreshold, uint64_t firstIndex, size_t indexCount, uint64_t *output) {
+    const __m256i indexOffsets = _mm256_set_epi64x(3, 2, 1, 0);
+    const __m128 thresholds = _mm_set1_ps(threshold);
+    const __m128 humidityThresholds = _mm_set1_ps(humidityThreshold);
+    __m128 weights[3][2][2];
+    for (int climate = 0; climate < 3; climate++) {
+        for (int half = 0; half < 2; half++) {
+            for (int octave = 0; octave < 2; octave++) {
+                weights[climate][half][octave] = _mm_set1_ps(FLOAT_GATE_WEIGHTS[climate][half][octave]);
+            }
+        }
+    }
+    __m256i moves[16];
+    __m128i floatMoves[16]; // moves for 4 floats
+    loadCompressMoves(moves);
+    for (int passed = 0; passed < 16; passed++) {
+        int32_t lanes[4] = {0};
+        int slot = 0;
+        for (int lane = 0; lane < 4; lane++) {
+            if (passed & (1 << lane)) {
+                lanes[slot++] = lane;
+            }
+        }
+        floatMoves[passed] = _mm_loadu_si128((const __m128i *) lanes);
+    }
+
+    static __thread uint64_t queueIndexes[2][QUEUE_SIZE + 4];
+    static __thread uint64_t queueLows[2][QUEUE_SIZE + 4];
+    static __thread uint64_t queueHighs[2][QUEUE_SIZE + 4];
+    static __thread float queueTotals[2][QUEUE_SIZE + 4];
+
+    size_t passCount = 0;
+    size_t i = 0;
+    while (i < indexCount) {
+        size_t queued = 0;
+        size_t end = i + QUEUE_SIZE;
+        if (end > indexCount) {
+            end = indexCount;
+        }
+
+        // Humidity
+        for (; i + 4 <= end; i += 4) {
+            __m256i indexes = _mm256_add_epi64(_mm256_set1_epi64x((long long) (firstIndex + i)), indexOffsets);
+            __m256i low;
+            __m256i high;
+            seedRandoms(indexes, &low, &high);
+
+            __m128 totals = floatClimateTotals(0, low, high, weights);
+            int passed = _mm_movemask_ps(_mm_cmp_ps(totals, humidityThresholds, _CMP_LE_OQ));
+            if (passed) {
+                _mm256_storeu_si256((__m256i *) (queueIndexes[0] + queued), compressLongs(indexes, moves[passed]));
+                _mm256_storeu_si256((__m256i *) (queueLows[0] + queued), compressLongs(low, moves[passed]));
+                _mm256_storeu_si256((__m256i *) (queueHighs[0] + queued), compressLongs(high, moves[passed]));
+                _mm_storeu_ps(queueTotals[0] + queued, _mm_permutevar_ps(totals, floatMoves[passed]));
+                queued += (size_t) __builtin_popcount((unsigned) passed);
+            }
+        }
+
+        // The last few indexes of the range go through one by one
+        uint64_t leftoverIndexes[4];
+        size_t leftoverCount = floatGateOneByOne(threshold, humidityThreshold, firstIndex + i, end - i, leftoverIndexes);
+        i = end;
+
+        // Erosion, then weirdness
+        for (int climate = 1; climate <= 2; climate++) {
+            int source = climate == 1 ? 0 : 1;
+            int destination = climate == 1 ? 1 : 0;
+
+            // Fill the rest of the last group of 4 with seeds that can't pass
+            for (size_t j = queued; j < ((queued + 3) & ~3UL); j++) {
+                queueIndexes[source][j] = 0;
+                queueLows[source][j] = 0;
+                queueHighs[source][j] = 0;
+                queueTotals[source][j] = 1e9f;
+            }
+
+            size_t kept = 0;
+            for (size_t j = 0; j < queued; j += 4) {
+                __m256i indexes = _mm256_loadu_si256((const __m256i *) (queueIndexes[source] + j));
+                __m256i low = _mm256_loadu_si256((const __m256i *) (queueLows[source] + j));
+                __m256i high = _mm256_loadu_si256((const __m256i *) (queueHighs[source] + j));
+                __m128 totals = _mm_add_ps(_mm_loadu_ps(queueTotals[source] + j), floatClimateTotals(climate, low, high, weights));
+                int passed = _mm_movemask_ps(_mm_cmp_ps(totals, thresholds, _CMP_LE_OQ));
+                if (passed) {
+                    _mm256_storeu_si256((__m256i *) (queueIndexes[destination] + kept), compressLongs(indexes, moves[passed]));
+                    if (climate == 1) {
+                        _mm256_storeu_si256((__m256i *) (queueLows[destination] + kept), compressLongs(low, moves[passed]));
+                        _mm256_storeu_si256((__m256i *) (queueHighs[destination] + kept), compressLongs(high, moves[passed]));
+                        _mm_storeu_ps(queueTotals[destination] + kept, _mm_permutevar_ps(totals, floatMoves[passed]));
+                    }
+                    kept += (size_t) __builtin_popcount((unsigned) passed);
+                }
+            }
+            queued = kept;
+        }
+
+        if (queued) {
+            memcpy(output + passCount, queueIndexes[0], queued * 8);
+            passCount += queued;
+        }
+        for (size_t j = 0; j < leftoverCount; j++) {
+            output[passCount++] = leftoverIndexes[j];
+        }
+    }
+    return passCount;
+}
+#else
+size_t floatGateIndexes(float threshold, float humidityThreshold, uint64_t firstIndex, size_t indexCount, uint64_t *output) {
+    return floatGateOneByOne(threshold, humidityThreshold, firstIndex, indexCount, output);
+}
+#endif
+
+
 int gateLanes(void) {
     return 4;
 }
@@ -509,6 +833,10 @@ int gateLanes(void) {
 // Without AVX-512 or AVX2 the gate checks the indexes one by one
 size_t gateIndexes(double threshold, uint64_t firstIndex, size_t indexCount, uint64_t *output) {
     return gateOneByOne(threshold, firstIndex, indexCount, output);
+}
+
+size_t floatGateIndexes(float threshold, float humidityThreshold, uint64_t firstIndex, size_t indexCount, uint64_t *output) {
+    return floatGateOneByOne(threshold, humidityThreshold, firstIndex, indexCount, output);
 }
 
 
