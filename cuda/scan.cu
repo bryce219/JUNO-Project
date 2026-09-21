@@ -1203,7 +1203,7 @@ static double findGateThreshold(double rate) {
 }
 
 // Runs the CPU gate on worker threads. Batches are made of whole chunks, in order, since the checkpoint counts whole chunks.
-// The workers can't get more than MAX_AHEAD chunks ahead of the batches
+// The workers can't get more than maxAhead chunks ahead of the batches
 struct GateProducer {
     enum {
         CHUNK_SIZE = 1 << 22,
@@ -1214,6 +1214,8 @@ struct GateProducer {
     uint64_t firstIndex;
     long indexCount;
     long chunkCount;
+    double passShare; // the share of a chunk that passes, with some room
+    long maxAhead;
 
     struct Chunk {
         std::vector<uint64_t> passed; // The stream indexes that passed the gate
@@ -1238,10 +1240,14 @@ struct GateProducer {
      * @param first The index to start from
      * @param rangeSize How many indexes to gate
      * @param threadCount The number of worker threads
+     * @param rate The gate rate in percent
      */
-    GateProducer(uint64_t first, long rangeSize, int threadCount) : chunks(MAX_AHEAD) {
+    GateProducer(uint64_t first, long rangeSize, int threadCount, double rate) : chunks(MAX_AHEAD) {
         firstIndex = first;
         indexCount = rangeSize;
+        passShare = rate / 100 * 1.1;
+        // At high gate rates the chunks get big, so fewer of them wait (about 512 MB), but still two for each worker
+        maxAhead = std::min((long) MAX_AHEAD, std::max(2L * threadCount, (long) (512e6 / (CHUNK_SIZE * passShare * 8))));
 
         // round up, the last chunk can be smaller
         chunkCount = rangeSize / CHUNK_SIZE;
@@ -1281,7 +1287,7 @@ struct GateProducer {
             {
                 std::unique_lock<std::mutex> guard(lock);
                 // Wait while the workers are too far ahead of the batches
-                while (!stop && nextChunk < chunkCount && nextChunk >= usedChunks + MAX_AHEAD) {
+                while (!stop && nextChunk < chunkCount && nextChunk >= usedChunks + maxAhead) {
                     wantWork.wait(guard);
                 }
                 if (stop || nextChunk >= chunkCount) {
@@ -1294,7 +1300,7 @@ struct GateProducer {
             long start = chunkIndex * (long) CHUNK_SIZE;
             long chunkSize = std::min((long) CHUNK_SIZE, indexCount - start);
             std::vector<uint64_t> passed;
-            passed.reserve((size_t) (chunkSize / 16 + 64));
+            passed.reserve((size_t) (chunkSize * passShare + 64));
             for (long offset = 0; offset < chunkSize; offset += PIECE_SIZE) {
                 long pieceSize = std::min((long) PIECE_SIZE, chunkSize - offset);
                 size_t passCount = gateIndexes(gateThreshold, firstIndex + (uint64_t) (start + offset), (size_t) pieceSize, pieceOutput.data());
@@ -1524,7 +1530,7 @@ struct GateHelper {
      */
     void schedule(uint64_t rangeFirst, long queued, long rangeSize) {
         std::lock_guard<std::mutex> guard(lock);
-        if (scheduledUpTo < queued) {
+        if (scheduledUpTo <= queued) {
             scheduledUpTo = queued + 2 * batchSpan; // the next two batches are too close for the threads to finish in time
         }
         while (scheduledUpTo < queued + (long) LOOKAHEAD * batchSpan && scheduledUpTo + batchSpan <= rangeSize && !freeParts.empty()) {
@@ -2276,7 +2282,7 @@ static void stopOnGpuError() {
     }
 }
 
-static bool allocateBatchSlot(BatchSlot &batch) {
+static bool allocateBatchSlot(BatchSlot &batch, bool cpuAssist) {
     if (cudaStreamCreateWithFlags(&batch.stream, cudaStreamNonBlocking) != cudaSuccess) { return false; }
 
     if (cudaMalloc(&batch.seeds, BATCH_SIZE * 8) != cudaSuccess) { return false; }
@@ -2289,7 +2295,7 @@ static bool allocateBatchSlot(BatchSlot &batch) {
     if (cudaMalloc(&batch.indexes, (size_t) BATCH_SIZE * 8) != cudaSuccess) { return false; }
     if (cudaMalloc(&batch.built, (size_t) SHUFFLE_CHUNK * BUILT_WORDS(6) * 8) != cudaSuccess) { return false; }
     if (cudaMalloc(&batch.gatedCount, 4) != cudaSuccess) { return false; }
-    if (cudaMalloc(&batch.helperOffsets, (size_t) BATCH_SIZE * 4) != cudaSuccess) { return false; }
+    if (cpuAssist && cudaMalloc(&batch.helperOffsets, (size_t) BATCH_SIZE * 4) != cudaSuccess) { return false; }
     return true;
 }
 
@@ -3028,8 +3034,10 @@ int main(int argc, char **argv) {
     std::vector<std::vector<uint64_t> > hostIndexes(settings.streams);
     std::vector<uint64_t> hostSeeds(BATCH_SIZE);
     std::vector<CascadeResult> hostResults(BATCH_SIZE);
-    for (int i = 0; i < settings.streams; i++) {
-        hostIndexes[i].reserve(BATCH_SIZE);
+    if (settings.cpuGate) { // only the CPU gate fills these
+        for (int i = 0; i < settings.streams; i++) {
+            hostIndexes[i].reserve(BATCH_SIZE);
+        }
     }
     const long finishedAtStart = finished;
     ScanResults results;
@@ -3044,7 +3052,7 @@ int main(int argc, char **argv) {
     // They finish in the order they started so finished never counts a batch the GPU is still working on
     std::vector<BatchSlot> batches(settings.streams);
     for (int i = 0; i < settings.streams; i++) {
-        if (!allocateBatchSlot(batches[i])) {
+        if (!allocateBatchSlot(batches[i], settings.cpuAssist)) {
             fprintf(stderr, "Couldn't make the GPU buffers! %d streams need about %.1f GB of GPU memory, try fewer with --streams\n", settings.streams,
                     0.3 + 1.2 * settings.streams);
             return 1;
@@ -3085,10 +3093,13 @@ int main(int argc, char **argv) {
             } else {
                 gateHelper->schedule(offset + start, queued, rangeSize);
                 printf("Using %d CPU threads to help the GPU gate\n", helperThreads);
+                if (floatGateLanes() == 1) {
+                    printf("This CPU has neither AVX-512 nor AVX2 with FMA, so they can't help much\n");
+                }
             }
         }
     } else {
-        gate = new GateProducer(offset + start + (uint64_t) finished, rangeSize - finished, gateThreads);
+        gate = new GateProducer(offset + start + (uint64_t) finished, rangeSize - finished, gateThreads, settings.gateRate);
         if (gateLanes() == 8) {
             printf("Using %d threads for the CPU gate (with AVX-512), it lets %g%% of the indexes through\n", gateThreads, settings.gateRate);
         } else if (gateLanes() == 4) {

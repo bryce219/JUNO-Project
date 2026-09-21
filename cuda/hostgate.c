@@ -844,3 +844,14 @@ int gateLanes(void) {
     return 1;
 }
 #endif
+
+// Seeds floatGateIndexes checks at a time, picked the same way as its versions above
+int floatGateLanes(void) {
+#if defined(__AVX512DQ__) && defined(__AVX512VL__) && defined(__FMA__)
+    return 8;
+#elif !defined(__AVX512DQ__) && defined(__AVX2__) && defined(__FMA__)
+    return 4;
+#else
+    return 1;
+#endif
+}

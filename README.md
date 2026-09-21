@@ -97,7 +97,7 @@ make
 
 That compiles the cubiomes files, the CPU gate and the scanner in the `cuda` folder. The first time it also builds and runs `genlut`, which makes the lookup table (`lut263.bin` and `lut263.h`). `make test` then scores a seed whose score is known on the CPU and says PASS or FAIL. That checks cubiomes and the CPU side of the build, but not the GPU part (`make run` and `make status` do that). `make clean` deletes everything it built, the lookup table included. `make help` lists all of the commands.
 
-By default it builds for an RTX 40 series card (`sm_89`). For another card use `ARCH` with your card's compute capability, e.g. `make ARCH=sm_86` for the 30 series. It remembers the card (even after `make clean`), so you only have to do that once. You'll want about 6 GB of free GPU memory.
+By default it builds for an RTX 40 series card (`sm_89`). For another card use `ARCH` with your card's compute capability, e.g. `make ARCH=sm_86` for the 30 series. It remembers the card (even after `make clean`), so you only have to do that once. You'll want about 6 GB of free GPU memory, or about 1.5 GB with `--streams 1` (it's slower though).
 
 Build it on the computer you're going to run it on, the CPU gate (for `--cpu-gate` and `--cpu-assist`) gets compiled with `-march=native`. If your CPU doesn't have AVX-512 the gate falls back to a slower version (when the scanner starts it writes which one it's using to `results/gpu_scan.log`). That one keeps a few more seeds and is several times slower per thread.
 
@@ -147,7 +147,7 @@ The OPTIONS only count for that `make run` (the watchdog keeps using them until 
 | `--high-value` | Tighter GPU filters and a wider gate that go after the best hits (ARBITRATIONS 85 and up). See Looking for the best seeds |
 | `--all-hits` | The wider filters again. This is what you get anyway, it's there to turn `--high-value` back off |
 | `--gate-rate <percent>` | The percent of the indexes the gate lets through (3.5 if you leave it out, 7 with `--high-value`, 10 with `--high-value --cpu-gate`) |
-| `--cpu-gate` | Run the gate on the CPU threads, the way v1.1 did. The GPU does it about ten times faster, so this is mostly there for comparing |
+| `--cpu-gate` | Run the gate on the CPU threads, the way v1.1 did (add `--gate-rate 1` to look at the same seeds as v1.1). The GPU does it about ten times faster, so this is mostly there for comparing |
 | `--cpu-assist` | The CPU threads gate part of every batch, so the GPU gate has less to do. About 5 to 10% faster, but it keeps your CPU busy |
 | `--gate-threads <n>` | Threads for the CPU gate with `--cpu-gate` or `--cpu-assist` (all but one or two of your CPU threads with `--cpu-gate`, all but four with `--cpu-assist`, if you leave it out) |
 | `--streams <n>` | Batches the GPU works on at once (5 if you leave it out). Fewer of them needs less GPU memory, for cards with less to spare |

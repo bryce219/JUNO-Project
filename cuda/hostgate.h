@@ -32,6 +32,9 @@ size_t floatGateIndexes(float threshold, float humidityThreshold, uint64_t first
 // Seeds the gate checks at a time: 8 with AVX-512, 4 with AVX2, 1 without either
 int gateLanes(void);
 
+// The same for floatGateIndexes, which needs FMA too
+int floatGateLanes(void);
+
 #ifdef __cplusplus
 }
 #endif
