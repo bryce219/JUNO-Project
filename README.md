@@ -216,7 +216,7 @@ The scanner saves into the `results` folder at the top of the project, and makes
 - `results/gpu_scan.log` has what the scanner and the supervisor print (errors included), and `results/watchdog.log` what the watchdog does.
 - `results/gpu_speed.txt` is the speed, for `make status`.
 
-The gate runs on the GPU. With `--cpu-gate` it uses all your CPU threads but two, and with `--cpu-assist` all but four.
+The gate runs on the GPU. With `--cpu-gate` it uses all your CPU threads but one or two, and with `--cpu-assist` all but four.
 
 ### If something goes wrong
 If the scanner stops 3 times in a row without saving any progress (usually a GPU problem, like running out of GPU memory or a CUDA error), the supervisor gives up. `make status` then shows the watchdog running but the supervisor and the scanner not. The reason is in `results/gpu_scan.log`, right above the line where the supervisor gives up (`make log` might not show the reason, and only shows anything if it was open at the time). Fix the problem, then `make stop` and `make run`.
