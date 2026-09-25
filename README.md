@@ -1,5 +1,5 @@
 # JUNO
-JUNO (Just Use Noise Once) is a GPU seed finder for Minecraft 26.3 - it looks for the seeds with the most even mix of biomes around the world origin. This is release v1.1.
+JUNO (Just Use Noise Once) is a GPU seed finder for Minecraft 26.3 - it looks for the seeds with the most even mix of biomes around the world origin. This is release v1.2.
 
 ## Quick start
 ```sh
@@ -14,7 +14,7 @@ make stop     # stop searching, make run carries on from there next time
 
 ```
 $ make run
-JUNO v1.1
+JUNO v1.2
 There's no checkpoint yet, so this starts at index 0
 Picked a random custom seed and saved it to ../results/custom_seed.txt: h1OZIrYad5z9qGHL
 The custom seed moves the stream by 14890994237487958828
@@ -31,14 +31,14 @@ Showing new records (Ctrl+C closes the log, JUNO keeps running)
 [00:38:10] New record (SENTS and ARBITRATIONS)! seed 244007842027566613  SENTS 0.912024061  ARBITRATIONS 83.174149635
 ```
 
-The first time, records come in within seconds on my machine, and after that they get rarer. Records are counted against every hit you already have though, so later on `make log` starts with a "Best so far" line and a new record can take hours. So if you just want to know it's actually doing something, run `make status` after half a minute and check the progress goes up and there's a speed. Every hit (SENTS 0.905 and up) also goes into `results/gpu_hits.jsonl`, about 10 a minute here, and `make top N=10` lists the best ones.
+The first time, records come in within seconds on my machine, and after that they get rarer. Records are counted against every hit you already have though, so later on `make log` starts with a "Best so far" line and a new record can take hours. So if you just want to know it's actually doing something, run `make status` after half a minute and check the progress goes up and there's a speed. Every hit (SENTS 0.905 and up) also goes into `results/gpu_hits.jsonl`, about 65 a minute here, and `make top N=10` lists the best ones.
 
 `make run` only checks the range before it says it's running, the GPU gets set up after that in the background. So if the GPU part fails (not enough GPU memory, the wrong ARCH for your card), the scanner stops, `make status` shows `Scanner: not running`, and the reason is in `results/gpu_scan.log`.
 
 ## What it does
 - Scores seeds with SENTS (Scaled ENTropy Score), basically how evenly the surface biomes are spread over the $4096 \times 4096$ block square centred on the origin
 - Minecraft 26.3, all 52 above-ground overworld biomes
-- Billions of seeds a second (a quick CPU check throws out most of them before the GPU ever sees them).
+- Billions of seeds a second (a quick check at the start throws out most of them before the expensive part).
 - Hits get scored again on the CPU with cubiomes before they're saved, and you get their ARBITRATIONS score too.
 - You decide what SENTS or ARBITRATIONS score a hit needs to get saved
 - Everyone gets their own stream of seeds. The first run picks a random custom seed and keeps it, so people scanning at the same time don't redo each other's work.
@@ -46,7 +46,7 @@ The first time, records come in within seconds on my machine, and after that the
 - `make log` shows new records as they come in, `make status` shows how it's doing, `make score` scores any seed on the CPU and `make top` goes through your hits.
 
 ## The score
-For a set of $N$ biomes, where $p_i$ is the fraction of the area that biome $i$ covers, the score of that seed (SENTS) is given by this piecewise function:
+For a set of $N$ biomes, where $p_i$ is the fraction of the area that biome $i$ covers ($i = 1, \dots, N$), the score of that seed (SENTS) is given by this piecewise function:
 
 ```math
 \mathrm{SENTS} = \begin{cases}
@@ -75,7 +75,7 @@ Scoring a seed properly means reading all $1024 \times 1024$ cells, which takes 
 
 The scanner goes through a stream of indexes (an index gets turned into a seed with a splitmix64 mix). A batch of indexes goes through these steps:
 
-1. The CPU gate. CPU threads look at a few octave offsets of the seed (humidity, erosion and weirdness), with AVX-512 if the CPU has it. Only about 1% of the indexes make it to the GPU.
+1. The gate. It looks at a few octave offsets of the seed (humidity, erosion and weirdness), on the GPU (or on CPU threads with `--cpu-gate`). Only 3.5% of the indexes get through (7% with `--high-value`).
 2. The temperature kernel builds the temperature noise and samples a $9 \times 9$ grid. It checks how evenly the samples spread over the temperature bands, then checks the temperature score.
 3. The humidity kernel adds humidity at those points and checks the cell score.
 4. The probe kernel adds continentalness and erosion, then checks the probe score.
@@ -97,9 +97,9 @@ make
 
 That compiles the cubiomes files, the CPU gate and the scanner in the `cuda` folder. The first time it also builds and runs `genlut`, which makes the lookup table (`lut263.bin` and `lut263.h`). `make test` then scores a seed whose score is known on the CPU and says PASS or FAIL. That checks cubiomes and the CPU side of the build, but not the GPU part (`make run` and `make status` do that). `make clean` deletes everything it built, the lookup table included. `make help` lists all of the commands.
 
-By default it builds for an RTX 40 series card (`sm_89`). For another card use `ARCH` with your card's compute capability, e.g. `make ARCH=sm_86` for the 30 series. It remembers the card (even after `make clean`), so you only have to do that once. You'll want about 6 GB of free GPU memory.
+By default it builds for an RTX 40 series card (`sm_89`). For another card use `ARCH` with your card's compute capability, e.g. `make ARCH=sm_86` for the 30 series. It remembers the card (even after `make clean`), so you only have to do that once. You'll want about 6 GB of free GPU memory, or about 1.5 GB with `--streams 1` (it's slower though).
 
-Build it on the computer you're going to run it on, the gate gets compiled with `-march=native`. If your CPU doesn't have AVX-512 the gate falls back to a slower version (when the scanner starts it writes which one it's using to `results/gpu_scan.log`). That one keeps a few more seeds and is several times slower per thread, which will probably slow the whole search down.
+Build it on the computer you're going to run it on, the CPU gate (for `--cpu-gate` and `--cpu-assist`) gets compiled with `-march=native`. If your CPU doesn't have AVX-512 the gate falls back to a slower version (when the scanner starts it writes which one it's using to `results/gpu_scan.log`). That one keeps a few more seeds and is several times slower per thread.
 
 ## Running
 ```sh
@@ -144,8 +144,26 @@ The OPTIONS only count for that `make run` (the watchdog keeps using them until 
 | `--min-arbitrations <score>` | The ARBITRATIONS score a hit needs to get saved |
 | `--custom-seed <text>` | Scan the stream picked by this text (see Custom seeds). With `make run`, use `CUSTOM_SEED=<text>` |
 | `--plain-stream` | Scan the plain stream, without a custom seed |
+| `--high-value` | Tighter GPU filters and a wider gate that go after the best hits (ARBITRATIONS 85 and up). See Looking for the best seeds |
+| `--all-hits` | The wider filters again. This is what you get anyway, it's there to turn `--high-value` back off |
+| `--gate-rate <percent>` | The percent of the indexes the gate lets through (3.5 if you leave it out, 7 with `--high-value`, 10 with `--high-value --cpu-gate`) |
+| `--cpu-gate` | Run the gate on the CPU threads, the way v1.1 did (add `--gate-rate 1` to look at the same seeds as v1.1). The GPU does it about ten times faster, so this is mostly there for comparing |
+| `--cpu-assist` | The CPU threads gate part of every batch, so the GPU gate has less to do. About 5 to 10% faster, but it keeps your CPU busy |
+| `--gate-threads <n>` | Threads for the CPU gate with `--cpu-gate` or `--cpu-assist` (all but one or two of your CPU threads with `--cpu-gate`, all but four with `--cpu-assist`, if you leave it out) |
+| `--streams <n>` | Batches the GPU works on at once (5 if you leave it out). Fewer of them needs less GPU memory, for cards with less to spare |
 
 The SENTS minimum always applies (0.905 unless you raise it), so a hit also needs all 52 biomes even if you only ask for an ARBITRATIONS score. The GPU filters are tuned for hits with $\mathrm{SENTS} \ge 0.905$, and the scanner won't take anything lower. For a hit with all 52 biomes $\mathrm{ARBITRATIONS} \approx 100 \cdot \mathrm{SENTS}^2$, which puts the lowest ARBITRATIONS minimum at $100 \cdot 0.905^2 = 81.9025$ (so `--min-arbitrations 81.9` gets turned down).
+
+### Looking for the best seeds
+By default JUNO saves every hit from SENTS 0.905 up and lets 3.5% of the indexes through the gate. `--high-value` goes after the top of the tail instead: every filter gets tighter and the gate opens to 7%, so almost nothing under ARBITRATIONS 84.25 makes it through.
+
+```sh
+make run OPTIONS="--high-value"
+```
+
+It keeps 96% of the known hits over ARBITRATIONS 85 and all of the ones over 86. On my machine it finds about as many hits between 85 and 86 an hour as the default settings, and roughly 1.7 times as many over 86.
+
+A higher gate rate lets through more of the good seeds for each index, but the GPU has more to work through, so fewer indexes go by a second. 3.5% and 7% were the best on my machine when I tested them. With `--cpu-gate --gate-rate 1` it looks at the same seeds v1.1 did, and it finds the same hits.
 
 You can run the scanner yourself from the `cuda` folder too, in the foreground, with the options above: `./scan [options] run` or `./scan [options] <start index> [count]`. Run it from inside that folder though, it looks for `lut263.bin` and `../results` relative to where it's run. It only prints a few lines when it starts, and a summary when it stops (Ctrl+C stops it the same way `make stop` does, and a second Ctrl+C stops it right away). `make log` and `make status` still work while it runs, but nothing restarts it if it crashes. There's also `--prepare`, which only checks the range and saves the checkpoint (that's the first thing `make run` does).
 
@@ -159,7 +177,7 @@ Scanner:     running
 Saved seed:  h1OZIrYad5z9qGHL (the custom seed new ranges use)
 Progress:    128.4 billion indexes done, starting from index 0 (this range goes until you stop it)
              (the checkpoint was saved 17 seconds ago)
-Speed:       about 4.3 billion indexes a second
+Speed:       about 10.4 billion indexes a second
 Hits:        9 saved in results/gpu_hits.jsonl
 Best hit:    seed 244007842027566613  SENTS 0.912024061  ARBITRATIONS 83.174150
 ```
@@ -198,7 +216,7 @@ The scanner saves into the `results` folder at the top of the project, and makes
 - `results/gpu_scan.log` has what the scanner and the supervisor print (errors included), and `results/watchdog.log` what the watchdog does.
 - `results/gpu_speed.txt` is the speed, for `make status`.
 
-The gate uses all your CPU threads but two.
+The gate runs on the GPU. With `--cpu-gate` it uses all your CPU threads but one or two, and with `--cpu-assist` all but four.
 
 ### If something goes wrong
 If the scanner stops 3 times in a row without saving any progress (usually a GPU problem, like running out of GPU memory or a CUDA error), the supervisor gives up. `make status` then shows the watchdog running but the supervisor and the scanner not. The reason is in `results/gpu_scan.log`, right above the line where the supervisor gives up (`make log` might not show the reason, and only shows anything if it was open at the time). Fix the problem, then `make stop` and `make run`.
@@ -221,10 +239,11 @@ Each hit is one JSON line:
 - `make stop` and `make status` only look at the copy of JUNO they're run in (they go by the folder a process runs in). The lock only knows about JUNO scanners, so `make run` and the supervisor also won't start a scanner while any other program called `scan` is running.
 - `make score`, `make top` and `make test` run the same `scan` program. While one of them is going, `make run` says JUNO is already running, `make status` shows the scanner as running, the supervisor won't restart a crashed scanner, and `make stop` stops it (a long `make score` just gets cut off). They're usually done in a few seconds.
 - The scanner uses the first GPU. You can pick a different one with `CUDA_VISIBLE_DEVICES`.
-- Without AVX-512 the gate is a lot slower (see Building it).
+- Without AVX-512 the CPU gate is a lot slower (see Building it).
+- The CPU checks one hit for each of its threads at a time. With a fast GPU and a slow CPU the GPU ends up waiting for it, and `--min-sents` or `--high-value` gives it fewer hits to check.
 
 ## Performance
-On my Ryzen 9 7950X3D and RTX 4080 SUPER the scanner gets through a bit over 4 billion stream indexes per second, with something like 40 million a second making it past the gate to the GPU. The settings were tuned on that machine (the `ARCH` default in the `Makefile`, and the thread and stream counts in `cuda/scan.cu`), so your numbers will be different - especially without AVX-512.
+On my Ryzen 9 7950X3D and RTX 4080 SUPER the scanner gets through about 10.4 billion stream indexes per second (7.8 billion with `--high-value`), with about 365 million a second making it past the gate. `--cpu-assist` adds another 5 to 10%. The settings were tuned on that machine (the `ARCH` default in the `Makefile`, and the thread and stream counts in `cuda/scan.cu`), so your numbers will be different.
 
 ## Credits
 - Cubitect, for cubiomes, which all of the biome generation here is built on.

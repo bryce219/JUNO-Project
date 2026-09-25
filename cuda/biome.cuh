@@ -76,27 +76,29 @@ DEV double xNextDouble(XoroshiroState *random) {
 // Octaves for all six climate values (shift, temperature, humidity, continentalness, erosion and weirdness)
 #define OCTAVE_COUNT 46
 
-// A Perlin noise octave
+// A Perlin noise octave (the offsets are in fixed point)
 struct Octave {
     uint8_t permutation[257];
     uint8_t yLattice;
-    double offsetX;
-    double offsetZ;
-    double amplitude;
-    double lacunarity;
-    double yFraction;
-    double yFade;
+    uint8_t shift;      // how far to shift the position for this octave
+    uint8_t secondHalf; // 1 if it's in the second Perlin noise
+    uint32_t offsetX;
+    uint32_t offsetZ;
+    float amplitude;
+    float yFraction;
+    float yFade;
 };
 
-// An Octave without the permutation array. The temperature, humidity and probe kernels use this and keep the permutations seperate
+// An Octave without the permutation array. The probe and build kernels use this and keep the permutations seperate
 struct OctaveHeader {
-    double offsetX;
-    double offsetZ;
-    double amplitude;
-    double lacunarity;
-    double yFraction;
-    double yFade;
+    uint32_t offsetX;
+    uint32_t offsetZ;
+    float amplitude;
+    float yFraction;
+    float yFade;
     uint8_t yLattice;
+    uint8_t shift;
+    uint8_t secondHalf;
 };
 
 // md5 salts of "octave_-12" to "octave_0"
@@ -129,179 +131,51 @@ __constant__ ClimateNoise CLIMATE_NOISE[6] = {
     {0xd02491e6058f6fd8ULL, 0x4792512c94c17a80ULL, -9, 5, {1, 1, 0, 1, 1}, 25.0 / 18, 32, 8},                 // Erosion
     {0xefc8ef4d36102b34ULL, 0x1beeeb324a0f24eaULL, -7, 6, {1, 2, 1, 0, 0, 0}, 15.0 / 12, 40, 6}};             // Weirdness
 
-// Starting lacunarity and persistence for a climate noise,
-// lacuna_ini and persist_ini in cubiomes
-__constant__ double LACUNARITY_START[13] = {1, .5, .25, 1. / 8, 1. / 16, 1. / 32, 1. / 64, 1. / 128,
-                                            1. / 256, 1. / 512, 1. / 1024, 1. / 2048, 1. / 4096};
+// Starting persistence for a climate noise, persist_ini in cubiomes
 __constant__ double PERSISTENCE_START[10] = {0, 1, 2. / 3, 4. / 7, 8. / 15, 16. / 31, 32. / 63,
                                              64. / 127, 128. / 255, 256. / 511};
 
 // The second Perlin noise multiplies the position by this
 #define SECOND_SCALE (337.0 / 331.0)
 
-// fade curve for Perlin noise
-DEV double fade(double fraction) {
-    return fraction * fraction * fraction * (fraction * (fraction * 6.0 - 15.0) + 10.0);
-}
-
-/**
- * @brief Shuffles the permutation array for an octave and fills in the rest of the octave
- * 
- * @param octave The octave (Octave or OctaveHeader)
- * @param permutation The permutation array to shuffle into
- * @param random The random generator for this octave
- */
-template <class OctaveType>
-DEV void shuffleOctave(OctaveType *octave, uint8_t *permutation, XoroshiroState *random, double amplitude, double lacunarity) {
-    octave->offsetX = xNextDouble(random) * 256.0;
-    double offsetY = xNextDouble(random) * 256.0;
-    octave->offsetZ = xNextDouble(random) * 256.0;
-
-    // Start with 0, 1, 2 ... 255, we fill it in 8 bytes at a time
-    uint64_t *words = (uint64_t *) permutation;
-    for (int i = 0; i < 32; i++) {
-        words[i] = 0x0706050403020100ULL + 0x0808080808080808ULL * (uint64_t) i;
-    }
-
-    for (int i = 0; i < 256; i++) {
-        int j = xNextInt(random, 256 - i) + i;
-        uint8_t temp = permutation[i];
-        permutation[i] = permutation[j];
-        permutation[j] = temp;
-    }
-    permutation[256] = permutation[0];
-
-    double yFloor = floor(offsetY);
-    double yFraction = offsetY - yFloor;
-    octave->yLattice = (uint8_t) (int) yFloor;
-    octave->yFraction = yFraction;
-    octave->yFade = fade(yFraction);
-    octave->amplitude = amplitude;
-    octave->lacunarity = lacunarity;
-}
-
-/**
- * @brief Builds one octave of a climate noise
- * 
- * @param octave Where the octave goes (Octave or OctaveHeader)
- * @param permutation The permutation array to shuffle into
- * @param octaveIndex Index of the octave in the octave array
- * @param seedLow The low random number of the world seed
- * @param seedHigh The high random number of the world seed
- */
-template <class OctaveType>
-DEV void buildOctave(OctaveType *octave, uint8_t *permutation, int octaveIndex, uint64_t seedLow, uint64_t seedHigh) {
-    // Find which climate value this octave belongs to
-    int climateIndex = 0;
-    while (climateIndex < 5 && octaveIndex >= CLIMATE_NOISE[climateIndex + 1].firstSlot) {
-        climateIndex++;
-    }
-    const ClimateNoise &noise = CLIMATE_NOISE[climateIndex];
-
-    int localIndex = octaveIndex - noise.firstSlot;
-    int secondHalf = localIndex >= noise.slotCount / 2; // whether or not it's in the second Perlin noise
-    int wantedOctave = localIndex - secondHalf * (noise.slotCount / 2);
-
-    XoroshiroState random;
-    random.low = seedLow ^ noise.saltLow;
-    random.high = seedHigh ^ noise.saltHigh;
-    uint64_t firstLow = xNextLong(&random);
-    uint64_t firstHigh = xNextLong(&random);
-    uint64_t secondLow = xNextLong(&random);
-    uint64_t secondHigh = xNextLong(&random);
-
-    uint64_t halfLow = firstLow;
-    uint64_t halfHigh = firstHigh;
-    if (secondHalf) {
-        halfLow = secondLow;
-        halfHigh = secondHigh;
-    }
-
-    double lacunarity = LACUNARITY_START[-noise.firstOctave];
-    double persistence = PERSISTENCE_START[noise.amplitudeCount];
-    int octavesSeen = 0;
-    for (int i = 0; i < noise.amplitudeCount; i++, lacunarity *= 2.0, persistence *= 0.5) {
-        if (noise.amplitudes[i] == 0) {
-            continue;
-        }
-        if (octavesSeen == wantedOctave) {
-            XoroshiroState octaveRandom;
-            octaveRandom.low = halfLow ^ OCTAVE_SALTS[12 + noise.firstOctave + i][0];
-            octaveRandom.high = halfHigh ^ OCTAVE_SALTS[12 + noise.firstOctave + i][1];
-            shuffleOctave(octave, permutation, &octaveRandom, noise.amplitudes[i] * persistence, lacunarity);
-            return;
-        }
-        octavesSeen++;
-    }
-}
-
-// Dot product of the gradient the hash picks with the offset (indexedLerp in cubiomes)
-DEV float gradientDot(uint8_t hash, float fractionX, float fractionY, float fractionZ) {
-    switch (hash & 0xf) {
-    case 0:
-        return fractionX + fractionY;
-    case 1:
-        return -fractionX + fractionY;
-    case 2:
-        return fractionX - fractionY;
-    case 3:
-        return -fractionX - fractionY;
-    case 4:
-        return fractionX + fractionZ;
-    case 5:
-        return -fractionX + fractionZ;
-    case 6:
-        return fractionX - fractionZ;
-    case 7:
-        return -fractionX - fractionZ;
-    case 8:
-        return fractionY + fractionZ;
-    case 9:
-        return -fractionY + fractionZ;
-    case 10:
-        return fractionY - fractionZ;
-    case 11:
-        return -fractionY - fractionZ;
-    case 12:
-        return fractionX + fractionY;
-    case 13:
-        return -fractionY + fractionZ;
-    case 14:
-        return -fractionX + fractionY;
-    default:
-        return -fractionY - fractionZ;
-    }
+// Dot product of the gradient the hash picks with the offset (indexedLerp in cubiomes), with bit masks and not a switch
+DEV float gradientDot(uint32_t hash, float fractionX, float fractionY, float fractionZ) {
+    hash &= 15;
+    float first = (0x50FFu >> hash) & 1 ? fractionX : fractionY;
+    float second = (0x500Fu >> hash) & 1 ? fractionY : fractionZ;
+    first = __int_as_float(__float_as_int(first) ^ (int) (((0xEAAAu >> hash) & 1) << 31));
+    second = __int_as_float(__float_as_int(second) ^ (int) (((0x8CCCu >> hash) & 1) << 31));
+    return first + second;
 }
 
 DEV float interpolate(float part, float start, float end) {
     return start + part * (end - start);
 }
 
+// The amplitudes of the double Perlin noises in CLIMATE_NOISE, as floats
+__constant__ float CLIMATE_AMPLITUDES[6] = {(float) (15.0 / 12), (float) (15.0 / 12), (float) (10.0 / 9),
+                                            (float) (45.0 / 30), (float) (25.0 / 18), (float) (15.0 / 12)};
+
+// SECOND_SCALE times 2^40, for the fixed point positions
+#define SECOND_SCALE_FIXED 1119442352147LL
+
 /**
  * @brief Samples a Perlin octave at y = 0, with floats for the gradient math
- * @param octave The octave (an Octave or an OctaveHeader)
- * @param permutation The shuffled permutation array of the octave
- * @param noiseX The x position in the noise
- * @param noiseZ The z position in the noise
+ * @param octave The octave
+ * @param noiseX The x position in the noise in fixed point, with the offset added
+ * @param noiseZ The z position
  */
-template <class OctaveType>
-DEV float samplePerlinOctave(const OctaveType *octave, const uint8_t *permutation, double noiseX, double noiseZ) {
-    float fadeY = (float) octave->yFade;
+DEV float samplePerlinOctave(const Octave *octave, uint32_t noiseX, uint32_t noiseZ) {
+    const uint8_t *permutation = octave->permutation;
+    float fadeY = octave->yFade;
     uint8_t latticeY = octave->yLattice;
-    noiseX += octave->offsetX;
-    noiseZ += octave->offsetZ;
-    double floorX = floor(noiseX);
-    double floorZ = floor(noiseZ);
-    noiseX -= floorX;
-    noiseZ -= floorZ;
-
-    uint8_t latticeX = (uint8_t) (int) floorX;
-    uint8_t latticeZ = (uint8_t) (int) floorZ;
-    float fadeX = (float) fade(noiseX);
-    float fadeZ = (float) fade(noiseZ);
-    float fractionX = (float) noiseX;
-    float fractionY = (float) octave->yFraction;
-    float fractionZ = (float) noiseZ;
+    uint8_t latticeX = (uint8_t) (noiseX >> 24);
+    uint8_t latticeZ = (uint8_t) (noiseZ >> 24);
+    float fractionX = (float) (noiseX & 0xFFFFFFu) * (1.0f / 16777216.0f);
+    float fractionZ = (float) (noiseZ & 0xFFFFFFu) * (1.0f / 16777216.0f);
+    float fadeX = fractionX * fractionX * fractionX * (fractionX * (fractionX * 6.0f - 15.0f) + 10.0f);
+    float fadeZ = fractionZ * fractionZ * fractionZ * (fractionZ * (fractionZ * 6.0f - 15.0f) + 10.0f);
+    float fractionY = octave->yFraction;
 
     // hash the 8 corners of the cell
     uint8_t hashX0 = permutation[latticeX] + latticeY;
@@ -329,32 +203,43 @@ DEV float samplePerlinOctave(const OctaveType *octave, const uint8_t *permutatio
     return interpolate(fadeZ, corner1, corner5);
 }
 
+// A position (in 1:4 biome cells) for the first and second Perlin noise, in fixed point
+struct NoisePosition {
+    int64_t first;
+    int64_t second;
+};
+
+// Returns the NoisePosition for a position
+DEV NoisePosition toNoisePosition(int position) {
+    NoisePosition fixed;
+    fixed.first = (int64_t) position << 40;
+    fixed.second = (int64_t) position * SECOND_SCALE_FIXED;
+    return fixed;
+}
+
 /**
  * @brief Samples the double Perlin noise of a climate value at y = 0, from octaves that are already built
  * @param octaves The octave array
  * @param climateIndex Which climate value (see CLIMATE_NOISE)
- * @param noiseX The x position in the noise
- * @param noiseZ The z position in the noise
- * @return double The noise value
+ * @param positionX The x position from toNoisePosition
+ * @param positionZ The z position from toNoisePosition
+ * @return float The noise value
  */
-DEV double sampleClimate(const Octave *octaves, int climateIndex, double noiseX, double noiseZ) {
+DEV float sampleClimate(const Octave *octaves, int climateIndex, NoisePosition positionX, NoisePosition positionZ) {
     const ClimateNoise &noise = CLIMATE_NOISE[climateIndex];
-    int halfCount = noise.slotCount / 2;
-    double total = 0;
+    int slotCount = noise.slotCount;
+    float total = 0;
 
-    for (int i = 0; i < halfCount; i++) {
+    for (int i = 0; i < slotCount; i++) {
         const Octave *octave = octaves + noise.firstSlot + i;
-        double scale = octave->lacunarity;
-        total += octave->amplitude * (double) samplePerlinOctave(octave, octave->permutation, noiseX * scale, noiseZ * scale);
+        int shift = octave->shift;
+        int64_t scaledX = octave->secondHalf ? positionX.second : positionX.first;
+        int64_t scaledZ = octave->secondHalf ? positionZ.second : positionZ.first;
+        uint32_t noiseX = (uint32_t) (scaledX >> shift) + octave->offsetX;
+        uint32_t noiseZ = (uint32_t) (scaledZ >> shift) + octave->offsetZ;
+        total += octave->amplitude * samplePerlinOctave(octave, noiseX, noiseZ);
     }
-
-    for (int i = 0; i < halfCount; i++) {
-        const Octave *octave = octaves + noise.firstSlot + halfCount + i;
-        double scale = octave->lacunarity;
-        total += octave->amplitude * (double) samplePerlinOctave(octave, octave->permutation, noiseX * SECOND_SCALE * scale, noiseZ * SECOND_SCALE * scale);
-    }
-
-    return total * noise.amplitude;
+    return total * CLIMATE_AMPLITUDES[climateIndex];
 }
 
 // Any low enough depth keeps the cave biomes out of reach and doesn't change the surface biome. genlut.c has to use the same value
@@ -365,16 +250,19 @@ DEV double sampleClimate(const Octave *octaves, int climateIndex, double noiseX,
  */
 DEV void climateAt(const Octave *octaves, int positionX, int positionZ, int64_t climate[6]) {
     // No coordinate warp here, the CPU check of the hits still does it. Skipping it lost about 1 in 60 of the high scoring seeds in testing
-    float temperature = (float) sampleClimate(octaves, 1, positionX, positionZ);
-    float humidity = (float) sampleClimate(octaves, 2, positionX, positionZ);
-    float continentalness = (float) sampleClimate(octaves, 3, positionX, positionZ);
-    float erosion = (float) sampleClimate(octaves, 4, positionX, positionZ);
-    float weirdness = (float) sampleClimate(octaves, 5, positionX, positionZ);
+    NoisePosition noiseX = toNoisePosition(positionX);
+    NoisePosition noiseZ = toNoisePosition(positionZ);
+    float temperature = sampleClimate(octaves, 1, noiseX, noiseZ);
+    float humidity = sampleClimate(octaves, 2, noiseX, noiseZ);
+    float continentalness = sampleClimate(octaves, 3, noiseX, noiseZ);
+    float erosion = sampleClimate(octaves, 4, noiseX, noiseZ);
+    float weirdness = sampleClimate(octaves, 5, noiseX, noiseZ);
 
-    climate[0] = (int64_t) (10000.0f * temperature);
-    climate[1] = (int64_t) (10000.0f * humidity);
-    climate[2] = (int64_t) (10000.0f * continentalness);
-    climate[3] = (int64_t) (10000.0f * erosion);
+    // These are nowhere near 2^31, an int is plenty and it's a lot faster
+    climate[0] = (int) (10000.0f * temperature);
+    climate[1] = (int) (10000.0f * humidity);
+    climate[2] = (int) (10000.0f * continentalness);
+    climate[3] = (int) (10000.0f * erosion);
     climate[4] = FIXED_DEPTH;
-    climate[5] = (int64_t) (10000.0f * weirdness);
+    climate[5] = (int) (10000.0f * weirdness);
 }

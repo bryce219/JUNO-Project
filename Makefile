@@ -22,7 +22,7 @@ help:
 	@echo "         START=<index>			...start a new range from this index instead"
 	@echo "         COUNT=<count>			...and end that range after this many indexes (needs START)"
 	@echo "         CUSTOM_SEED=<text>		...in your own stream (otherwise it uses the one saved in results/custom_seed.txt)"
-	@echo "         OPTIONS=\"...\"			...with scanner options (--min-sents, --min-arbitrations, --plain-stream)"
+	@echo "         OPTIONS=\"...\"			...with scanner options (--min-sents, --min-arbitrations, --gate-rate, --cpu-gate, --cpu-assist, --gate-threads, --streams, --high-value, --all-hits, --plain-stream)"
 	@echo "make log				Watch for new records as they come in (Ctrl+C just closes the log)"
 	@echo "         MIN_SENTS=<score>		...show every new hit with at least this SENTS score instead"
 	@echo "         MIN_ARBITRATIONS=<score>	...or at least this ARBITRATIONS score"
