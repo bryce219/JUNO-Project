@@ -113,6 +113,11 @@ DEV void shuffleShared(uint8_t *table, uint32_t *tableWords, XoroshiroState *ran
     }
 }
 
+// The screening kernels (temperature, humidity and probe build) skip xNextInt's redraw check when this is defined. A shuffle
+// needs a redraw about 1 time in 130,000, and that seed then gets screened with a slightly wrong octave. The cascade's
+// shuffle (shuffleShared) still checks and the CPU check has the final say. It takes 2 of the ~22 instructions out of a step.
+#define SCREEN_SHUFFLE_FAST
+
 // Threads in a block for the kernels that shuffle in the shared tables
 #define TABLE_THREADS 128
 #define TABLE_BLOCKS 3 // blocks on an SM at once
@@ -183,7 +188,9 @@ DEV void shuffleTable(uint8_t *table, XoroshiroState random) {
         for (int part = 0; part < 16; part++) {
             uint32_t bound = 256 - (i + part);
             uint32_t result = nextLowWord(split);
+#ifndef SCREEN_SHUFFLE_FAST
             lowestProduct = min(lowestProduct, result * bound);
+#endif
             // The entry to swap with
             uint8_t *other = row + multiplyHighAdd(result, bound, part) * 128;
             uint8_t temp = row[part * 128];

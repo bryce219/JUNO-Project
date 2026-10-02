@@ -110,6 +110,14 @@ Next to the default settings it finds about as many hits between 85 and 86 an ho
 
 **The histograms from a table.** Every edge the temperature kernel counts against (the 5 bands, the 16 bins of the score, the near-edge windows) sits on a grid of $1/400$ from $-1$ to $1$, so a sample looks up what it adds to all three histograms in one go.
 
+## Two shortcuts that can change the answer (but almost never do)
+
+**The pre-score** (section 2) drops seeds before the temperature kernel sees them. With the default cuts it loses about 1 in 10,000 of the seeds the temperature kernel would have kept, and with `--high-value` about 1 in 6,000.
+
+**No redraw check in the screening shuffles.** Java's `nextInt` draws again when a product lands in a narrow window, and a whole shuffle needs that about 1 time in 130,000. The temperature, humidity and probe build kernels skip the check (`SCREEN_SHUFFLE_FAST` in selector_cache.cuh), which takes 2 of the ~22 instructions out of a shuffle step. A seed that needed the redraw gets screened with a slightly wrong octave.
+
+Both only touch the screening. A seed that gets to the cascade has its octaves built with the exact shuffle, and the CPU check scores it with cubiomes, so a hit's score is never off. The worst that can happen is a missed seed.
+
 ## Compared with previous work (arb4096_crunch_final)
 
 Their search does one seed at a time on CPU threads:
