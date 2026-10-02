@@ -36,6 +36,8 @@ There's a free cut here. The humidity kernel later checks this kind of evenness 
 
 The octave gets built first, in its own kernel (the temperature build kernel), which shuffles in shared memory and saves the gradients of the lattice corners the grid can touch. The temperature kernel samples those, in floats (see the shortcuts at the end), and its cuts are a hair looser than the double ones to make up for the rounding.
 
+The build kernel also does a pre-score. While it still has the corners in registers it samples every other row and column of the grid (25 of the 81 points) and works out $E_T$ and the temperature score from just those. A seed that's a long way under either cut gets dropped right there, and the ones that pass go to the front of the chunk, so the temperature kernel only runs on those (about 37% of the gated seeds, 29% with `--high-value`). The pre-cuts are loose on purpose: $E_T \ge 0.93$ and a score of at least $-8$ (0.94 and $-6$ with `--high-value`). On a test range (2 to 3 trillion indexes) they dropped 0.010% of the seeds the temperature kernel would have kept by default and 0.017% with `--high-value`, and the hits came out the same. `--no-prescore` turns it off. It only runs with the GPU gate, `--cpu-gate` goes straight to the temperature kernel like before.
+
 Then there's the temperature score, which basically guesses whether the humidity kernel is going to keep the seed anyway. It's a logistic model on the band shares, $E_T$, the mean and spread of the samples, how many samples sit near a band edge, and a 16-bin histogram. Cut at 0.4127 it kept pretty much all (99.9%) of the good seeds the humidity kernel would have kept, at least when I fit it.
 
 ## 3. The humidity kernel

@@ -146,6 +146,7 @@ The OPTIONS only count for that `make run` (the watchdog keeps using them until 
 | `--plain-stream` | Scan the plain stream, without a custom seed |
 | `--high-value` | Tighter GPU filters and a wider gate that go after the best hits (ARBITRATIONS 85 and up). See Looking for the best seeds |
 | `--all-hits` | The wider filters again. This is what you get anyway, it's there to turn `--high-value` back off |
+| `--no-prescore` | Turns the temperature pre-score off (see FILTERS.md). A bit slower, it's only there so you can compare |
 | `--gate-rate <percent>` | The percent of the indexes the gate lets through (3.5 if you leave it out, 7 with `--high-value`, 10 with `--high-value --cpu-gate`) |
 | `--cpu-gate` | Run the gate on the CPU threads, the way v1.1 did (add `--gate-rate 1` to look at the same seeds as v1.1). The GPU does it about ten times faster, so this is mostly there for comparing |
 | `--cpu-assist` | The CPU threads gate part of every batch, so the GPU gate has less to do. About 5 to 10% faster, but it keeps your CPU busy |

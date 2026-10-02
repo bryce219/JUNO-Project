@@ -578,6 +578,151 @@ DEV void filterHumidity(const uint64_t *record, const uint64_t *built, uint32_t 
     }
 }
 
+// The pre-score. The temperature build kernel still has a seed's corner slices in registers when it's done, so it can sample
+// the grid itself before anything gets saved. It reads every other row and column (25 of the 81 points), works out the band
+// evenness and the temperature score from those (same weights, shares over 25 samples, and a sample counts as near an edge
+// when it's within 0.03 of it), and drops the seed if either one is a long way under the temperature kernel's cut. The seeds
+// that pass go to the front of the chunk, so the temperature kernel only runs on those (about 37% of the gated seeds with
+// the default cuts and 29% with --high-value). The pre-cuts are much looser than the real ones (0.93 and -8, or 0.94 and
+// -6 with --high-value). On a test range they dropped 0.010% of the seeds the temperature kernel keeps by default and
+// 0.017% of the ones it keeps with --high-value, and the hits came out the same.
+__constant__ float PRE_MIN_EVENNESS = 0.93f;
+__constant__ float PRE_MIN_SCORE = -8.0f;
+static bool preScoreOn = true; // --no-prescore turns it off
+
+DEV bool passesPreScore(const uint64_t slices[2][4], const HalfHeader halves[2], const GradientTable *gradients) {
+    GridSteps columns[2];
+    uint32_t startRow[2];
+#pragma unroll
+    for (int half = 0; half < 2; half++) {
+        fillGridSteps(&columns[half], half, 10, halves[half].offsetX);
+        startRow[half] = (halves[half].offsetZ + (uint32_t) GRID_POSITIONS[half][10][0]) >> 24;
+    }
+    uint64_t amounts = 0, binsLow = 0, binsHigh = 0; // 7 bit amounts: the 5 bands then the 4 near-edge counts; 16 bins
+    float sum = 0, squareSum = 0;
+#pragma unroll 1
+    for (int row = 0; row < 9; row += 2) {
+        RowCell rowCells[2][3];
+#pragma unroll
+        for (int half = 0; half < 2; half++) {
+            uint32_t noise = halves[half].offsetZ + (uint32_t) GRID_POSITIONS[half][10][row];
+            int rowCell = (int) (uint8_t) ((noise >> 24) - startRow[half]);
+            float rowFraction = fractionOf(noise), rowFade = fade(rowFraction);
+            uint32_t nearZ = (uint32_t) slices[half][0], farZ = (uint32_t) slices[half][1];
+            if (rowCell == 1) { nearZ = (uint32_t) slices[half][1]; farZ = (uint32_t) slices[half][2]; }
+            else if (rowCell == 2) { nearZ = (uint32_t) slices[half][2]; farZ = (uint32_t) slices[half][3]; }
+#pragma unroll
+            for (int cell = 0; cell < 3; cell++) {
+                if (half == 0 && cell == 2) continue;
+                collapseRowCell(nearZ, farZ, cell, halves[half].yFraction, halves[half].yFade, rowFraction, rowFade, &rowCells[half][cell], gradients);
+            }
+        }
+#pragma unroll
+        for (int column = 0; column < 9; column += 2) {
+            float halfValues[2];
+#pragma unroll
+            for (int half = 0; half < 2; half++) {
+                int cell = columns[half].cell[column];
+                RowCell picked = rowCells[half][0];
+                if (cell == 1) picked = rowCells[half][1];
+                else if (half == 1 && cell == 2) picked = rowCells[half][2];
+                float fractionX = columns[half].fraction[column];
+                float nearX = fmaf(picked.nearSlope, fractionX, picked.nearConstant);
+                float farX = fmaf(picked.farSlope, fractionX - 1.0f, picked.farConstant);
+                halfValues[half] = interpolate(columns[half].fade[column], nearX, farX);
+            }
+            float t = (halfValues[0] + halfValues[1]) * (float) (1.5 * PERSISTENCE * (15.0 / 12));
+            int band = (t >= -0.45f) + (t >= -0.15f) + (t >= 0.2f) + (t >= 0.55f);
+            amounts += 1ULL << (7 * band);
+            amounts += (fabsf(t + 0.45f) < 0.03f ? 1ULL << 35 : 0) + (fabsf(t + 0.15f) < 0.03f ? 1ULL << 42 : 0)
+                     + (fabsf(t - 0.2f) < 0.03f ? 1ULL << 49 : 0) + (fabsf(t - 0.55f) < 0.03f ? 1ULL << 56 : 0);
+            int bin = min(max((int) floorf(8.0f * t) + 8, 0), 15);
+            binsLow += bin < 8 ? 1ULL << (7 * bin) : 0;
+            binsHigh += bin < 8 ? 0 : 1ULL << (7 * (bin - 8));
+            sum += t;
+            squareSum += t * t;
+        }
+    }
+    const float inv = 1.0f / 25;
+    float entropy = 0;
+#pragma unroll
+    for (int band = 0; band < 5; band++) {
+        float share = (float) tableAmount(amounts, band) * inv;
+        entropy += share * FLOAT_BAND_LOG_WEIGHTS[band] - (share > 0 ? share * __logf(share) : 0.0f);
+    }
+    float evenness = entropy * FLOAT_INVERSE_LOG_TOTAL;
+    float mean = sum * inv, variance = squareSum * inv - mean * mean;
+    float score = FLOAT_TEMPERATURE_SCORE_BIAS + FLOAT_TEMPERATURE_SCORE_WEIGHTS[10] * evenness + FLOAT_TEMPERATURE_SCORE_WEIGHTS[11] * mean
+                  + FLOAT_TEMPERATURE_SCORE_WEIGHTS[12] * sqrtf(fmaxf(variance, 0.0f));
+#pragma unroll
+    for (int i = 0; i < 5; i++) {
+        float share = (float) tableAmount(amounts, i) * inv;
+        score += FLOAT_TEMPERATURE_SCORE_WEIGHTS[i] * share + FLOAT_TEMPERATURE_SCORE_WEIGHTS[5 + i] * sqrtf(share);
+    }
+#pragma unroll
+    for (int i = 0; i < 4; i++) score += FLOAT_TEMPERATURE_SCORE_WEIGHTS[13 + i] * (float) tableAmount(amounts, 5 + i) * inv;
+#pragma unroll
+    for (int i = 0; i < 16; i++) {
+        float share = (float) tableBinAmount(binsLow, binsHigh, i) * inv;
+        score += FLOAT_TEMPERATURE_SCORE_WEIGHTS[17 + i] * share + FLOAT_TEMPERATURE_SCORE_WEIGHTS[33 + i] * sqrtf(share);
+    }
+    return evenness >= PRE_MIN_EVENNESS && score >= PRE_MIN_SCORE;
+}
+
+/**
+ * @brief temperatureBuildKernel with the pre-score: the seeds that pass get their corner slices saved at the next free
+ * slot of the chunk (keptCount counts them) and their index at keptIndexes[slot], so the temperature kernel can run on
+ * the kept seeds only
+ */
+__global__ void __launch_bounds__(TABLE_THREADS, TABLE_BLOCKS)
+temperatureBuildPreKernel(const uint64_t *indexes, int indexCount, uint64_t *built, const uint32_t *gatedCount, uint32_t chunkFirst,
+                          uint64_t *keptIndexes, uint32_t *keptCount) {
+    __shared__ uint32_t tableWords[64 * TABLE_THREADS];
+    __shared__ GradientTable gradients;
+    fillGradientTable(&gradients);
+    if (gatedCount) {
+        long left = gatedLeft(gatedCount, chunkFirst);
+        indexCount = (int) (left < indexCount ? left : indexCount);
+    }
+    int blockFirst = blockIdx.x * TABLE_THREADS;
+    if (blockFirst >= indexCount) {
+        return;
+    }
+    int i = blockFirst + threadIdx.x;
+    bool hasSeed = i < indexCount;
+    uint64_t index = indexes[hasSeed ? i : blockFirst];
+
+    uint64_t halfLow[2], halfHigh[2];
+    climateHalves(streamSeed(index), 0x5c7e6b29735f0d7fULL, 0xf7d86f1bbc734988ULL, halfLow, halfHigh); // temperature salt
+    uint8_t *table = tableStart(tableWords);
+    uint64_t slices[2][4];
+    HalfHeader headers[2];
+#pragma unroll 1
+    for (int half = 0; half < 2; half++) {
+        buildHalf(tableWords, table, halfLow[half], halfHigh[half], 2, half, 10, 3, slices[half], &headers[half]);
+    }
+    bool keep = hasSeed && passesPreScore(slices, headers, &gradients);
+
+    // A slot for each seed that passed, one atomic per warp
+    unsigned passedLanes = __ballot_sync(0xFFFFFFFFu, keep);
+    if (passedLanes) {
+        int lane = threadIdx.x & 31;
+        uint32_t warpFirst = 0;
+        if (lane == 0) {
+            warpFirst = atomicAdd(keptCount, (uint32_t) __popc(passedLanes));
+        }
+        warpFirst = __shfl_sync(0xFFFFFFFFu, warpFirst, 0);
+        if (keep) {
+            uint32_t slot = warpFirst + __popc(passedLanes & ((1u << lane) - 1));
+            keptIndexes[slot] = index;
+#pragma unroll
+            for (int half = 0; half < 2; half++) {
+                saveBuiltHalf(built + slot, 3, half, slices[half], headers[half]);
+            }
+        }
+    }
+}
+
 #define TEMPERATURE_BLOCKS 4 // Blocks of the temperature kernel on an SM at once. Tried a few and 4 was the fastest
 
 /**
@@ -1733,6 +1878,7 @@ struct Settings {
     int streams = STREAM_COUNT;         // Batches the GPU works on at once, fewer streams use less GPU memory
     bool cpuGate = false;               // --cpu-gate: run the gate on the CPU threads (hostgate.c)
     bool cpuAssist = false;             // --cpu-assist: the CPU threads gate part of every batch for the GPU
+    bool preScore = true;               // --no-prescore turns the temperature pre-score off
 };
 
 // Best seed so far, plus the hits
@@ -1979,6 +2125,7 @@ static void uploadHighValueCutoffs() {
     double probeThreshold = 11.0;
     double rankThresholds[5];
     double deepCutoffs[2] = {51.918, 52.918};
+    float preEvenness = 0.94f, preScore = -6.0f; // the pre-score cuts go up with the temperature ones
     cudaMemcpyFromSymbol(rankThresholds, RANK_THRESHOLD, sizeof(rankThresholds)); // level 1 keeps its cutoff
     rankThresholds[1] = 16;
     rankThresholds[2] = 22;
@@ -1990,6 +2137,8 @@ static void uploadHighValueCutoffs() {
     cudaMemcpyToSymbol(PROBE_SCORE_THRESHOLD, &probeThreshold, sizeof(probeThreshold));
     cudaMemcpyToSymbol(RANK_THRESHOLD, rankThresholds, sizeof(rankThresholds));
     cudaMemcpyToSymbol(DEEP_CUTOFFS, deepCutoffs, sizeof(deepCutoffs));
+    cudaMemcpyToSymbol(PRE_MIN_EVENNESS, &preEvenness, sizeof(preEvenness));
+    cudaMemcpyToSymbol(PRE_MIN_SCORE, &preScore, sizeof(preScore));
 }
 
 // Fills HISTOGRAM_TABLE from the temperature band edges (TEMP_EDGES), the 16 bins and the near-edge windows
@@ -2121,6 +2270,8 @@ struct BatchSlot {
     uint64_t *indexes;
     uint64_t *built;        // Where this slot's temperature and humidity build kernels save the corner slices
     uint32_t *gatedCount;   // How many indexes the GPU gate let into this batch
+    uint64_t *keptIndexes;  // The indexes of a chunk that passed the pre-score (see temperatureBuildPreKernel)
+    uint32_t *keptCounts;   // and how many there are, one count for each chunk
     uint32_t *helperOffsets; // The CPU threads' part of the batch (with --cpu-assist)
     GateHelper::Part *helperPart = NULL; // Goes back to the helper when the batch is done
     long span = 0;          // The size of the batch before the gate
@@ -2205,6 +2356,18 @@ static void startGateAndTemperature(BatchSlot &batch, uint64_t first, long span,
     }
 
     // The host doesn't know how many got through the gate, the kernels read the count themselves
+    if (preScoreOn) {
+        cudaMemsetAsync(batch.keptCounts, 0, (BATCH_SIZE / SHUFFLE_CHUNK) * 4, batch.stream);
+        for (long chunkFirst = 0; chunkFirst < BATCH_SIZE; chunkFirst += SHUFFLE_CHUNK) {
+            uint32_t *kept = batch.keptCounts + chunkFirst / SHUFFLE_CHUNK;
+            temperatureBuildPreKernel<<<(SHUFFLE_CHUNK + TABLE_THREADS - 1) / TABLE_THREADS, TABLE_THREADS, 0, batch.stream>>>(
+                batch.indexes + chunkFirst, SHUFFLE_CHUNK, batch.built, batch.gatedCount, (uint32_t) chunkFirst, batch.keptIndexes, kept);
+            // The temperature kernel reads the kept count where it would read the gate's count (so chunkFirst is 0)
+            temperatureKernel<<<(SHUFFLE_CHUNK + TEMPERATURE_THREADS - 1) / TEMPERATURE_THREADS, TEMPERATURE_THREADS, 0, batch.stream>>>(
+                batch.keptIndexes, SHUFFLE_CHUNK, batch.built, (uint32_t) RECORD_CAPACITY, batch.passCount, batch.records, kept, 0u);
+        }
+        return;
+    }
     for (long chunkFirst = 0; chunkFirst < BATCH_SIZE; chunkFirst += SHUFFLE_CHUNK) {
         temperatureBuildKernel<<<(SHUFFLE_CHUNK + TABLE_THREADS - 1) / TABLE_THREADS, TABLE_THREADS, 0, batch.stream>>>(
             batch.indexes + chunkFirst, SHUFFLE_CHUNK, batch.built, batch.gatedCount, (uint32_t) chunkFirst);
@@ -2295,6 +2458,8 @@ static bool allocateBatchSlot(BatchSlot &batch, bool cpuAssist) {
     if (cudaMalloc(&batch.indexes, (size_t) BATCH_SIZE * 8) != cudaSuccess) { return false; }
     if (cudaMalloc(&batch.built, (size_t) SHUFFLE_CHUNK * BUILT_WORDS(6) * 8) != cudaSuccess) { return false; }
     if (cudaMalloc(&batch.gatedCount, 4) != cudaSuccess) { return false; }
+    if (cudaMalloc(&batch.keptIndexes, (size_t) SHUFFLE_CHUNK * 8) != cudaSuccess) { return false; }
+    if (cudaMalloc(&batch.keptCounts, (BATCH_SIZE / SHUFFLE_CHUNK) * 4) != cudaSuccess) { return false; }
     if (cpuAssist && cudaMalloc(&batch.helperOffsets, (size_t) BATCH_SIZE * 4) != cudaSuccess) { return false; }
     return true;
 }
@@ -2404,6 +2569,7 @@ static void printUsage() {
            "                               the gate lets more through. You get a lot fewer hits, but the good ones show up\n"
            "                               a lot faster\n"
            "  --all-hits                   The wider filters, for all the hits from SENTS %.3f up (the default)\n"
+           "  --no-prescore                Turn the temperature pre-score off (a bit slower, it's there for comparing)\n"
            "  --prepare                    Only check the range and save the checkpoint, without scanning (make run does this)\n",
            LOWEST_MIN_SENTS, STREAM_COUNT, DEFAULT_GATE_RATE, HIGH_VALUE_GATE_RATE, HIGH_VALUE_CPU_GATE_RATE, LOWEST_MIN_SENTS);
 }
@@ -2513,6 +2679,8 @@ static bool readOptions(int argc, char **argv, Settings &settings, std::vector<c
             settings.cpuGate = true;
         } else if (strcmp(argv[i], "--cpu-assist") == 0) {
             settings.cpuAssist = true;
+        } else if (strcmp(argv[i], "--no-prescore") == 0) {
+            settings.preScore = false;
         } else if (strcmp(argv[i], "--min-arbitrations") == 0) {
             if (!readScore(argc, argv, i, settings.minArbitrations)) {
                 return false;
@@ -3006,6 +3174,10 @@ int main(int argc, char **argv) {
     printf("\n");
     if (settings.highValue) {
         printf("Looking for the best seeds, the GPU filters are tighter and let very few hits under ARBITRATIONS 85 through\n");
+    }
+    preScoreOn = settings.preScore;
+    if (!preScoreOn) {
+        printf("The temperature pre-score is off\n");
     }
 
     mkdir(RESULTS_FOLDER, 0755); // does nothing if it's already there
