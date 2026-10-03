@@ -1,5 +1,5 @@
 # JUNO
-JUNO (Just Use Noise Once) is a GPU seed finder for Minecraft 26.3 - it looks for the seeds with the most even mix of biomes around the world origin. This is release v1.2.
+JUNO (Just Use Noise Once) is a GPU seed finder for Minecraft 26.3 - it looks for the seeds with the most even mix of biomes around the world origin. This is release v1.3.
 
 ## Quick start
 ```sh
@@ -14,7 +14,7 @@ make stop     # stop searching, make run carries on from there next time
 
 ```
 $ make run
-JUNO v1.2
+JUNO v1.3
 There's no checkpoint yet, so this starts at index 0
 Picked a random custom seed and saved it to ../results/custom_seed.txt: h1OZIrYad5z9qGHL
 The custom seed moves the stream by 14890994237487958828
@@ -73,9 +73,9 @@ Unlike SENTS it doesn't drop to 0 if a biome is missing.
 ## How it works
 Scoring a seed properly means reading all $1024 \times 1024$ cells, which takes a few seconds on one CPU core. That's way too slow for billions of seeds. So JUNO throws out as many as it can with quick checks first, and only does the full scan for the few that look good.
 
-The scanner goes through a stream of indexes (an index gets turned into a seed with a splitmix64 mix). A batch of indexes goes through these steps:
+The scanner goes through a stream of indexes (an index gets turned into a seed with a multiply and an XOR, see Custom seeds). A batch of indexes goes through these steps:
 
-1. The gate. It looks at a few octave offsets of the seed (humidity, erosion and weirdness), on the GPU (or on CPU threads with `--cpu-gate`). Only 3.5% of the indexes get through (7% with `--high-value`).
+1. The gate. It looks at a few octave offsets of the seed (humidity, erosion and weirdness), on the GPU (or on CPU threads with `--cpu-gate`). Only 3.5% of the indexes get through (2.5% with `--high-value`).
 2. The temperature kernel builds the temperature noise and samples a $9 \times 9$ grid. It checks how evenly the samples spread over the temperature bands, then checks the temperature score.
 3. The humidity kernel adds humidity at those points and checks the cell score.
 4. The probe kernel adds continentalness and erosion, then checks the probe score.
@@ -144,27 +144,26 @@ The OPTIONS only count for that `make run` (the watchdog keeps using them until 
 | `--min-arbitrations <score>` | The ARBITRATIONS score a hit needs to get saved |
 | `--custom-seed <text>` | Scan the stream picked by this text (see Custom seeds). With `make run`, use `CUSTOM_SEED=<text>` |
 | `--plain-stream` | Scan the plain stream, without a custom seed |
-| `--high-value` | Tighter GPU filters and a wider gate that go after the best hits (ARBITRATIONS 85 and up). See Looking for the best seeds |
+| `--high-value` | Tighter GPU filters and a narrower gate that go after the best hits (ARBITRATIONS 85 and up). See Looking for the best seeds |
 | `--all-hits` | The wider filters again. This is what you get anyway, it's there to turn `--high-value` back off |
-| `--no-prescore` | Turns the temperature pre-score off (see FILTERS.md). A bit slower, it's only there so you can compare |
-| `--gate-rate <percent>` | The percent of the indexes the gate lets through (3.5 if you leave it out, 7 with `--high-value`, 10 with `--high-value --cpu-gate`) |
-| `--cpu-gate` | Run the gate on the CPU threads, the way v1.1 did (add `--gate-rate 1` to look at the same seeds as v1.1). The GPU does it about ten times faster, so this is mostly there for comparing |
-| `--cpu-assist` | The CPU threads gate part of every batch, so the GPU gate has less to do. About 5 to 10% faster, but it keeps your CPU busy |
+| `--gate-rate <percent>` | The percent of the indexes the gate lets through (3.5 if you leave it out, 2.5 with `--high-value`, 10 with `--high-value --cpu-gate`) |
+| `--cpu-gate` | Run the gate on the CPU threads, the way v1.1 did. The GPU does it about ten times faster, so this is mostly there for comparing |
+| `--cpu-assist` | The CPU threads gate part of every batch, so the GPU gate has less to do. About 10% faster with `--high-value` (next to nothing with the default settings), but it keeps your CPU busy |
 | `--gate-threads <n>` | Threads for the CPU gate with `--cpu-gate` or `--cpu-assist` (all but one or two of your CPU threads with `--cpu-gate`, all but four with `--cpu-assist`, if you leave it out) |
 | `--streams <n>` | Batches the GPU works on at once (5 if you leave it out). Fewer of them needs less GPU memory, for cards with less to spare |
 
 The SENTS minimum always applies (0.905 unless you raise it), so a hit also needs all 52 biomes even if you only ask for an ARBITRATIONS score. The GPU filters are tuned for hits with $\mathrm{SENTS} \ge 0.905$, and the scanner won't take anything lower. For a hit with all 52 biomes $\mathrm{ARBITRATIONS} \approx 100 \cdot \mathrm{SENTS}^2$, which puts the lowest ARBITRATIONS minimum at $100 \cdot 0.905^2 = 81.9025$ (so `--min-arbitrations 81.9` gets turned down).
 
 ### Looking for the best seeds
-By default JUNO saves every hit from SENTS 0.905 up and lets 3.5% of the indexes through the gate. `--high-value` goes after the top of the tail instead: every filter gets tighter and the gate opens to 7%, so almost nothing under ARBITRATIONS 84.25 makes it through.
+By default JUNO saves every hit from SENTS 0.905 up and lets 3.5% of the indexes through the gate. `--high-value` goes after the top of the tail instead: every filter gets tighter and the gate goes down to 2.5%, so almost nothing under ARBITRATIONS 84.25 makes it through.
 
 ```sh
 make run OPTIONS="--high-value"
 ```
 
-It keeps 96% of the known hits over ARBITRATIONS 85 and all of the ones over 86. On my machine it finds about as many hits between 85 and 86 an hour as the default settings, and roughly 1.7 times as many over 86.
+v1.3 raised its probe cutoff from 11 to 12, which loses 1 of the 67 seeds over ARBITRATIONS 86 that I know of (all 4 over 87 stay). Up to v1.2 it used a 7% gate. At 2.5% the scanner gets through about 2.4 times as many indexes a second, and a bit over half of the seeds over 87 that 7% lets through are still inside 2.5%, so it should find about 1.3 times as many of them an hour. That comes from a model of where the hits over 84 sit in the gate (anywhere from 1.05 to 1.6 times fits the data), since a hit over 87 only turns up about once every 30 hours, which is too rare to count directly.
 
-A higher gate rate lets through more of the good seeds for each index, but the GPU has more to work through, so fewer indexes go by a second. 3.5% and 7% were the best on my machine when I tested them. With `--cpu-gate --gate-rate 1` it looks at the same seeds v1.1 did, and it finds the same hits.
+A higher gate rate lets through more of the good seeds for each index, but the GPU has more to work through, so fewer indexes go by a second. 3.5% was the best for the default settings when I tested it. For `--high-value` anything from 2% to 3% came out about the same, so it uses 2.5%.
 
 You can run the scanner yourself from the `cuda` folder too, in the foreground, with the options above: `./scan [options] run` or `./scan [options] <start index> [count]`. Run it from inside that folder though, it looks for `lut263.bin` and `../results` relative to where it's run. It only prints a few lines when it starts, and a summary when it stops (Ctrl+C stops it the same way `make stop` does, and a second Ctrl+C stops it right away). `make log` and `make status` still work while it runs, but nothing restarts it if it crashes. There's also `--prepare`, which only checks the range and saves the checkpoint (that's the first thing `make run` does).
 
@@ -193,7 +192,7 @@ make top N=10 BY=arbitrations                 # the same, sorted by ARBITRATIONS
 `make score` uses the same CPU check the scanner does before it saves a hit, so each seed takes a few seconds. You can give it more than one seed with `SEED="<seed> <seed>"`. `make top` only lists a seed once, even if it got saved more than once.
 
 ### Custom seeds
-Index $j$ of the stream is the seed $\mathrm{mix}(\gamma j)$, where $\gamma = \mathtt{0x9E3779B97F4A7C15}$, $\mathrm{mix}$ is the output mix of splitmix64 and the math wraps around at $2^{64}$. That means two people who scan one range get identical seeds, which is a waste. A custom seed gives you your own stream.
+Index $j$ of the stream is the seed $\gamma j \oplus \sigma$, where $\gamma = \mathtt{0x9E3779B97F4A7C15}$, $\sigma = \mathtt{0x6A09E667F3BCC909}$, $\oplus$ is XOR and the math wraps around at $2^{64}$. That means two people who scan one range get identical seeds, which is a waste. A custom seed gives you your own stream.
 
 You don't have to pick one. The first time you start a range without `CUSTOM_SEED`, the scanner picks a random custom seed (16 letters and digits), saves it to `results/custom_seed.txt` and prints it. After that every new range uses the saved one. You can also give your own:
 
@@ -201,13 +200,15 @@ You don't have to pick one. The first time you start a range without `CUSTOM_SEE
 make run CUSTOM_SEED='bryCE219!'
 ```
 
-The scanner hashes the text (printable ASCII) into a 64-bit number $k$, using FNV-1a and then $\mathrm{mix}$, and index $j$ becomes the seed $\mathrm{mix}(\gamma (k + j))$. For `bryCE219!` that's $k = 13456412924314603523$. $k$ gets saved in the checkpoint. After that `make run` stays in your stream without the text. If you already have a checkpoint for a different stream, add `START=0` to start a range in the new one.
+The scanner hashes the text (printable ASCII) into a 64-bit number $k$, using FNV-1a and then $\mathrm{mix}$ (the output mix of splitmix64), and index $j$ becomes the seed $\gamma (k + j) \oplus \sigma$. For `bryCE219!` that's $k = 13456412924314603523$. $k$ gets saved in the checkpoint. After that `make run` stays in your stream without the text. If you already have a checkpoint for a different stream, add `START=0` to start a range in the new one.
 
 Careful with two things here. A new START without CUSTOM_SEED uses the saved seed from `results/custom_seed.txt`, not the one in the checkpoint, so give CUSTOM_SEED again when you start a new range in your own stream. And there's only one checkpoint, so switching to another stream loses your place in the old one. If you want to go back to it later, write down the checkpoint first (`results/gpu_progress.txt`, the numbers in `make status` are rounded). It's `juno-gpu-v1 <k> <start> <count> <done>`, so the START to carry on from is start + done, and if that range had a COUNT, the COUNT that's left is count - done.
 
 To scan the plain stream (to repeat someone else's range, say), give the range and add `OPTIONS=--plain-stream`. If you delete the `results` folder, the next range gets a new random custom seed, so keep a copy of `custom_seed.txt` if you want to know which part of which stream you've scanned.
 
-Two people with different custom seeds who scan $L$ indexes each overlap with a chance of approximately $2L / 2^{64}$. For a year of scanning on my machine that's only a percent or two, and even then it'd just be part of the ranges.
+Two people with different custom seeds who scan $L$ indexes each overlap with a chance of approximately $2L / 2^{64}$. For a year of scanning on my machine that's a few percent (about 4%, or 7% with `--high-value`), and even then it'd just be part of the ranges.
+
+Up to v1.2 index $j$ was the seed $\mathrm{mix}(\gamma j)$. Minecraft starts a seed's random numbers from $\mathrm{mix}(s \oplus \sigma)$ and $\mathrm{mix}((s \oplus \sigma) + \gamma)$, and for $s = \gamma j \oplus \sigma$ those are $\mathrm{mix}(\gamma j)$ and $\mathrm{mix}(\gamma (j + 1))$, so the next index reuses one of them. That takes the gate from three mixes an index down to one. The catch is that an index gives a different seed than it did in v1.2. A v1.2 checkpoint still works, `make run` carries on from the same index with the new seeds. The seeds v1.2 went through and the ones after them are two separate random picks, so a seed after the switch was already scanned with a chance of only $D / 2^{64}$, where $D$ is how many indexes v1.2 got through (about 1 in 5,000 after 3.4 quadrillion).
 
 ### Where the results go
 The scanner saves into the `results` folder at the top of the project, and makes the folder if it isn't there.
@@ -244,7 +245,7 @@ Each hit is one JSON line:
 - The CPU checks one hit for each of its threads at a time. With a fast GPU and a slow CPU the GPU ends up waiting for it, and `--min-sents` or `--high-value` gives it fewer hits to check.
 
 ## Performance
-On my Ryzen 9 7950X3D and RTX 4080 SUPER the scanner gets through about 10.4 billion stream indexes per second (7.8 billion with `--high-value`), with about 365 million a second making it past the gate. `--cpu-assist` adds another 5 to 10%. The settings were tuned on that machine (the `ARCH` default in the `Makefile`, and the thread and stream counts in `cuda/scan.cu`), so your numbers will be different.
+On my Ryzen 9 7950X3D and RTX 4080 SUPER the scanner gets through about 11.9 billion stream indexes per second (19.3 billion with `--high-value`), with about 415 million a second making it past the gate. `--cpu-assist` adds another 10% with `--high-value`, and next to nothing with the default settings (there the CPU threads are busy checking hits anyway). The settings were tuned on that machine (the `ARCH` default in the `Makefile`, and the thread and stream counts in `cuda/scan.cu`), so your numbers will be different.
 
 ## Credits
 - Cubitect, for cubiomes, which all of the biome generation here is built on.
