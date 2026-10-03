@@ -49,6 +49,12 @@ DEV uint32_t multiplyHighAdd(uint32_t value, uint32_t multiplier, uint32_t add) 
     return result;
 }
 
+// A draw only feeds (draw * bound) >> 32, so the shuffles add low + high without the carry from the low word into the high word.
+// That puts the draw off by at most one, in about 1 step in 2^16, and a draw off by one changes the swap in about 1 case in 2^24
+// (it has to sit right under a multiple of 2^32 / bound): about one table in 2^31 comes out different. Multiplying by this (a
+// multiplier the compiler can't see) puts the two adds on the multiply-add pipe instead of the busy ALU pipe
+__constant__ uint32_t PIPE_ONE = 1;
+
 /**
  * @brief Shuffles a thread's permutation array the way Minecraft does. If xNextInt might have had to draw again,
  * the shuffle gets redone the slow way
@@ -76,8 +82,7 @@ DEV void shuffleShared(uint8_t *table, uint32_t *tableWords, XoroshiroState *ran
 #pragma unroll
         for (int part = 0; part < 4; part++) {
             uint32_t bound = 256 - (i + part);
-            uint64_t sum = ((uint64_t) lowHigh << 32 | lowLow) + ((uint64_t) highHigh << 32 | highLow);
-            uint32_t result = __funnelshift_l((uint32_t) (sum >> 32), (uint32_t) sum, 17) + lowLow;
+            uint32_t result = __funnelshift_l(lowHigh * PIPE_ONE + highHigh, lowLow * PIPE_ONE + highLow, 17) + lowLow;
             uint32_t xorLow = lowLow ^ highLow;
             uint32_t xorHigh = lowHigh ^ highHigh;
             uint32_t nextLowLow = xor3(__funnelshift_r(lowLow, lowHigh, 15), xorLow, xorLow << 21);
@@ -120,23 +125,34 @@ DEV void shuffleShared(uint8_t *table, uint32_t *tableWords, XoroshiroState *ran
 // The number of 64 bit words a build kernel saves for a seed (the corner slices of both halves, then the two headers)
 #define BUILT_WORDS(side) (2 * ((side) + 1) + 4)
 
-// Returns where a thread's table starts. Entry p is at p * 128 from there
+// Multipliers the compiler can't see, so the shuffle's bound and its address math run on the multiply-add pipe (the ALU pipe is the
+// busy one)
+__constant__ int32_t PIPE_MINUS_ONE = -1;
+__constant__ uint32_t PIPE_QUARTER = 1u << 30;
+
+// A thread's table is 64 words, each with four entries in a row, and the words are TABLE_THREADS apart. So the lanes of a warp always
+// hit their own banks, and the shuffle can write four finished entries with one store
 DEV uint8_t *tableStart(uint32_t *tableWords) {
-    return (uint8_t *) tableWords + (threadIdx.x & 31) * 4 + (threadIdx.x >> 5);
+    return (uint8_t *) (tableWords + threadIdx.x);
+}
+
+// Where entry position is, from tableStart
+DEV uint32_t tableOffset(uint32_t position) {
+    return (position >> 2) * (TABLE_THREADS * 4) + (position & 3);
 }
 
 // Fills all of a block's tables with 0 to 255. All 128 threads have to call this
 DEV void resetTables(uint32_t *tableWords) {
     uint4 *quads = (uint4 *) tableWords;
-    for (int quad = threadIdx.x; quad < 2048; quad += TABLE_THREADS) {
-        uint32_t entry = (uint32_t) (quad >> 3) * 0x01010101u;
+    for (int quad = threadIdx.x; quad < 16 * TABLE_THREADS; quad += TABLE_THREADS) {
+        uint32_t entry = 0x03020100u + 0x04040404u * (uint32_t) (quad / (TABLE_THREADS / 4)); // a row of words is TABLE_THREADS / 4 quads
         quads[quad] = make_uint4(entry, entry, entry, entry);
     }
 }
 
 // Entry position of a thread's table (the position wraps around at 256)
 DEV uint32_t tableEntry(const uint8_t *table, uint32_t position) {
-    return table[(position & 255) * 128];
+    return table[tableOffset(position & 255)];
 }
 
 // A xoroshiro generator in 32 bit halves, like shuffleShared keeps it
@@ -148,9 +164,11 @@ struct SplitRandom {
 };
 
 // Returns the low 32 bits of xNextLong (all xNextInt needs)
+
 DEV uint32_t nextLowWord(SplitRandom &random) {
-    uint64_t sum = ((uint64_t) random.lowHigh << 32 | random.lowLow) + ((uint64_t) random.highHigh << 32 | random.highLow);
-    uint32_t result = __funnelshift_l((uint32_t) (sum >> 32), (uint32_t) sum, 17) + random.lowLow;
+    uint32_t sumLow = random.lowLow * PIPE_ONE + random.highLow;   // two plain adds on the multiply-add pipe, no carry
+    uint32_t sumHigh = random.lowHigh * PIPE_ONE + random.highHigh;
+    uint32_t result = __funnelshift_l(sumHigh, sumLow, 17) + random.lowLow; // the low word of rotateLeft(sum, 17)
     uint32_t xorLow = random.lowLow ^ random.highLow;
     uint32_t xorHigh = random.lowHigh ^ random.highHigh;
     uint32_t nextLowLow = xor3(__funnelshift_r(random.lowLow, random.lowHigh, 15), xorLow, xorLow << 21);
@@ -163,7 +181,8 @@ DEV uint32_t nextLowWord(SplitRandom &random) {
 }
 
 /**
- * @brief Shuffles a thread's table the way Minecraft does, like shuffleShared
+ * @brief Shuffles a thread's table the way Minecraft does, like shuffleShared, except that it ignores xNextInt's redraw (a
+ * draw gets redone when the low word of draw * bound is under the bound, which changes about 3 tables in 100,000)
  * 
  * @param table The thread's table (see tableStart), it has to hold 0 to 255 already
  * @param random The octave's random generator (after the offsets)
@@ -174,33 +193,29 @@ DEV void shuffleTable(uint8_t *table, XoroshiroState random) {
     split.lowHigh = (uint32_t) (random.low >> 32);
     split.highLow = (uint32_t) random.high;
     split.highHigh = (uint32_t) (random.high >> 32);
-    uint32_t lowestProduct = 0xFFFFFFFFu;
 
-    uint8_t *row = table;
+    // Entry i is done once step i swaps it, and nothing reads it again until the shuffle is over. So a step only writes the entry it
+    // swaps with, and the finished entries go out four at a time
+    uint8_t *row = table; // entry i
 #pragma unroll 1
-    for (int i = 0; i < 256; i += 16, row += 16 * 128) {
+    for (int i = 0; i < 256; i += 16, row += 16 * TABLE_THREADS) {
 #pragma unroll
-        for (int part = 0; part < 16; part++) {
-            uint32_t bound = 256 - (i + part);
-            uint32_t result = nextLowWord(split);
-            lowestProduct = min(lowestProduct, result * bound);
-            // The entry to swap with
-            uint8_t *other = row + multiplyHighAdd(result, bound, part) * 128;
-            uint8_t temp = row[part * 128];
-            row[part * 128] = *other;
-            *other = temp;
-        }
-    }
-
-    if (lowestProduct < 256) {
-        for (int i = 0; i < 256; i++) {
-            table[i * 128] = (uint8_t) i;
-        }
-        for (int i = 0; i < 256; i++) {
-            int j = xNextInt(&random, 256 - i) + i;
-            uint8_t temp = table[i * 128];
-            table[i * 128] = table[j * 128];
-            table[j * 128] = temp;
+        for (int word = 0; word < 4; word++) {
+            uint32_t finished = 0;
+#pragma unroll
+            for (int part = 4 * word; part < 4 * word + 4; part++) {
+                uint32_t bound = (uint32_t) (i * PIPE_MINUS_ONE + (256 - part));
+                uint32_t result = nextLowWord(split);
+                // The entry to swap with, as a distance from entry i (i is a multiple of 4, so tableOffset works on the distance)
+                uint32_t distance = multiplyHighAdd(result, bound, part);
+                uint32_t quarter = __umulhi(distance, PIPE_QUARTER); // distance >> 2
+                uint8_t *other = row + (distance + quarter * (TABLE_THREADS * 4 - 4));
+                uint8_t current = row[(part >> 2) * (TABLE_THREADS * 4) + (part & 3)];
+                uint8_t swapped = *other;
+                *other = current;
+                finished = (uint32_t) swapped * (1u << (8 * (part & 3))) + finished;
+            }
+            *(uint32_t *) (row + word * (TABLE_THREADS * 4)) = finished;
         }
     }
 }
@@ -273,6 +288,84 @@ DEV void buildHalf(uint32_t *tableWords, uint8_t *table, uint64_t halfLow, uint6
     cornerSlices(table, startX, (uint32_t) (yRandom >> 56), startZ, side, slices);
 }
 
+// Both halves' shuffles in one loop, two independent xoroshiro chains a thread for the scheduler to overlap. The tables sit in
+// slots t and t + 64 of the usual 128-slot block, so a block has 64 threads and the same shared memory. Like shuffleTable it
+// ignores xNextInt's redraw
+#define FUSED_THREADS (TABLE_THREADS / 2)
+
+DEV void shuffleTwoTables(uint8_t *tableA, uint8_t *tableB, XoroshiroState randomA, XoroshiroState randomB) {
+    SplitRandom splitA, splitB;
+    splitA.lowLow = (uint32_t) randomA.low;
+    splitA.lowHigh = (uint32_t) (randomA.low >> 32);
+    splitA.highLow = (uint32_t) randomA.high;
+    splitA.highHigh = (uint32_t) (randomA.high >> 32);
+    splitB.lowLow = (uint32_t) randomB.low;
+    splitB.lowHigh = (uint32_t) (randomB.low >> 32);
+    splitB.highLow = (uint32_t) randomB.high;
+    splitB.highHigh = (uint32_t) (randomB.high >> 32);
+    uint8_t *rowA = tableA, *rowB = tableB;
+#pragma unroll 1
+    for (int i = 0; i < 256; i += 16, rowA += 16 * TABLE_THREADS, rowB += 16 * TABLE_THREADS) {
+#pragma unroll
+        for (int word = 0; word < 4; word++) {
+            uint32_t finishedA = 0, finishedB = 0;
+#pragma unroll
+            for (int part = 4 * word; part < 4 * word + 4; part++) {
+                uint32_t bound = (uint32_t) (i * PIPE_MINUS_ONE + (256 - part));
+                uint32_t resultA = nextLowWord(splitA);
+                uint32_t resultB = nextLowWord(splitB);
+                uint32_t distanceA = multiplyHighAdd(resultA, bound, part);
+                uint32_t distanceB = multiplyHighAdd(resultB, bound, part);
+                uint8_t *otherA = rowA + (distanceA + __umulhi(distanceA, PIPE_QUARTER) * (TABLE_THREADS * 4 - 4));
+                uint8_t *otherB = rowB + (distanceB + __umulhi(distanceB, PIPE_QUARTER) * (TABLE_THREADS * 4 - 4));
+                uint8_t currentA = rowA[(part >> 2) * (TABLE_THREADS * 4) + (part & 3)];
+                uint8_t currentB = rowB[(part >> 2) * (TABLE_THREADS * 4) + (part & 3)];
+                uint8_t swappedA = *otherA;
+                uint8_t swappedB = *otherB;
+                *otherA = currentA;
+                *otherB = currentB;
+                finishedA = (uint32_t) swappedA * (1u << (8 * (part & 3))) + finishedA;
+                finishedB = (uint32_t) swappedB * (1u << (8 * (part & 3))) + finishedB;
+            }
+            *(uint32_t *) (rowA + word * (TABLE_THREADS * 4)) = finishedA;
+            *(uint32_t *) (rowB + word * (TABLE_THREADS * 4)) = finishedB;
+        }
+    }
+}
+
+// buildHalf for both halves at once (the whole block calls it: it resets all 128 table slots)
+DEV void buildTwoHalves(uint32_t *tableWords, const uint64_t *halfLow, const uint64_t *halfHigh, int saltIndex, int lacunarityExponent, int side,
+                        uint64_t *slices0, uint64_t *slices1, HalfHeader *header0, HalfHeader *header1) {
+    XoroshiroState random[2];
+    uint64_t yRandom[2];
+    HalfHeader *headers[2] = {header0, header1};
+#pragma unroll
+    for (int half = 0; half < 2; half++) {
+        random[half].low = halfLow[half] ^ OCTAVE_SALTS[saltIndex][0];
+        random[half].high = halfHigh[half] ^ OCTAVE_SALTS[saltIndex][1];
+        headers[half]->offsetX = octaveOffset(xNextLong(&random[half]));
+        yRandom[half] = xNextLong(&random[half]);
+        headers[half]->offsetZ = octaveOffset(xNextLong(&random[half]));
+    }
+    __syncthreads();
+    uint4 *quads = (uint4 *) tableWords;
+    for (int quad = threadIdx.x; quad < 16 * TABLE_THREADS; quad += FUSED_THREADS) {
+        uint32_t entry = 0x03020100u + 0x04040404u * (uint32_t) (quad / (TABLE_THREADS / 4));
+        quads[quad] = make_uint4(entry, entry, entry, entry);
+    }
+    __syncthreads();
+    uint8_t *tableA = (uint8_t *) (tableWords + threadIdx.x), *tableB = (uint8_t *) (tableWords + threadIdx.x + FUSED_THREADS);
+    shuffleTwoTables(tableA, tableB, random[0], random[1]);
+#pragma unroll
+    for (int half = 0; half < 2; half++) {
+        headers[half]->yFraction = fractionOf(octaveOffset(yRandom[half]));
+        headers[half]->yFade = fade(headers[half]->yFraction);
+        uint32_t startX = (headers[half]->offsetX + (uint32_t) GRID_POSITIONS[half][lacunarityExponent][0]) >> 24;
+        uint32_t startZ = (headers[half]->offsetZ + (uint32_t) GRID_POSITIONS[half][lacunarityExponent][0]) >> 24;
+        cornerSlices(half ? tableB : tableA, startX, (uint32_t) (yRandom[half] >> 56), startZ, side, half ? slices1 : slices0);
+    }
+}
+
 // Gets the random numbers the two halves of a climate value start from
 DEV void climateHalves(uint64_t seed, uint64_t saltLow, uint64_t saltHigh, uint64_t halfLow[2], uint64_t halfHigh[2]) {
     XoroshiroState random;
@@ -289,23 +382,23 @@ DEV void climateHalves(uint64_t seed, uint64_t saltLow, uint64_t saltHigh, uint6
 }
 
 // Saves a half's corner slices and header for a seed (built is the seed's first word, the next ones are SHUFFLE_CHUNK apart)
-DEV void saveBuiltHalf(uint64_t *built, int side, int half, const uint64_t *slices, const HalfHeader &header) {
+DEV void saveBuiltHalf(uint64_t *built, int side, int half, const uint64_t *slices, const HalfHeader &header, size_t stride = SHUFFLE_CHUNK) {
     for (int z = 0; z <= side; z++) {
-        built[(size_t) (half * (side + 1) + z) * SHUFFLE_CHUNK] = slices[z];
+        built[(size_t) (half * (side + 1) + z) * stride] = slices[z];
     }
     const int headerWord = 2 * (side + 1) + half * 2;
-    built[(size_t) headerWord * SHUFFLE_CHUNK] = header.offsetX | (uint64_t) header.offsetZ << 32;
-    built[(size_t) (headerWord + 1) * SHUFFLE_CHUNK] = __float_as_uint(header.yFraction) | (uint64_t) __float_as_uint(header.yFade) << 32;
+    built[(size_t) headerWord * stride] = header.offsetX | (uint64_t) header.offsetZ << 32;
+    built[(size_t) (headerWord + 1) * stride] = __float_as_uint(header.yFraction) | (uint64_t) __float_as_uint(header.yFade) << 32;
 }
 
 // Reads back what saveBuiltHalf saved
-DEV void readBuiltHalf(const uint64_t *built, int side, int half, uint64_t *slices, HalfHeader *header) {
+DEV void readBuiltHalf(const uint64_t *built, int side, int half, uint64_t *slices, HalfHeader *header, size_t stride = SHUFFLE_CHUNK) {
     for (int z = 0; z <= side; z++) {
-        slices[z] = built[(size_t) (half * (side + 1) + z) * SHUFFLE_CHUNK];
+        slices[z] = built[(size_t) (half * (side + 1) + z) * stride];
     }
     const int headerWord = 2 * (side + 1) + half * 2;
-    uint64_t offsets = built[(size_t) headerWord * SHUFFLE_CHUNK];
-    uint64_t fractions = built[(size_t) (headerWord + 1) * SHUFFLE_CHUNK];
+    uint64_t offsets = built[(size_t) headerWord * stride];
+    uint64_t fractions = built[(size_t) (headerWord + 1) * stride];
     header->offsetX = (uint32_t) offsets;
     header->offsetZ = (uint32_t) (offsets >> 32);
     header->yFraction = __uint_as_float((uint32_t) fractions);

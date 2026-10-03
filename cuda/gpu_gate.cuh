@@ -1,163 +1,178 @@
-// The gate from hostgate.c, on the GPU and in floats
+// The gate on the GPU. It adds up the same 12 terms as v1.2 (humidity, erosion and weirdness, the two lowest octaves of both
+// halves), in integers now, in two parts:
+//   1. humidity, both halves, for every index (two cuts: the first half's terms, then all of humidity)
+//   2. erosion, then weirdness, for the seeds left after humidity (about 28%), packed together in shared memory so the warps
+//      stay full
+// hostgate.c does exactly the same sums on the CPU (for --cpu-gate and --cpu-assist).
 #pragma once
+#include "hostgate.h"
 
-// The climate salts from hostgate.c
-__constant__ uint64_t GATE_CLIMATE_SALTS[3][2] = {
-    {0x81bb4d22e8dc168eULL, 0xf1c8b4bea16303cdULL},  // Humidity
-    {0xd02491e6058f6fd8ULL, 0x4792512c94c17a80ULL},  // Erosion
-    {0xefc8ef4d36102b34ULL, 0x1beeeb324a0f24eaULL}}; // Weirdness
-
-// The octave salts from hostgate.c, already stepped once (a step is just xors and shifts). uploadGpuGate fills this in
-__constant__ uint64_t GATE_STEPPED_SALTS[3][2][2];
-
-// The weights from hostgate.c as floats, [climate][half][octave]
-__constant__ float GATE_WEIGHTS[3][2][2] = {
-    {{1.000f, 0.281f}, {0.984f, 0.202f}},  // Humidity
-    {{0.464f, 0.245f}, {0.486f, 0.193f}},  // Erosion
-    {{0.197f, 0.182f}, {0.209f, 0.198f}}}; // Weirdness
-
-#define GATE_HUMIDITY_LIMIT 0.50 // We use hostgate.c's humidity cut too
 #define GATE_THREADS 256
-#define GATE_ITEMS 4             // How many indexes a thread checks humidity for
+#define GATE_ITEMS 8 // indexes in a row that a thread starts with, the stream lets it reuse a mix for the next one
+#define GATE_ROUND 2 // how many of them go through a round (the queue holds GATE_THREADS * GATE_ROUND seeds)
 
-// A xoroshiro step without making a number
-DEV void xoroshiroStep(uint64_t &low, uint64_t &high) {
+__constant__ uint64_t GATE_CLIMATE_SALTS[3][2];
+__constant__ uint64_t GATE_STEPPED_SALTS[3][2][2]; // the octave salts after one step, see uploadGpuGate
+__constant__ uint32_t GATE_WEIGHTS[3][2][2];
+
+DEV uint64_t gateOutput(uint64_t low, uint64_t high) {
+    return rotateLeft(low + high, 17) + low;
+}
+
+DEV void gateStep(uint64_t &low, uint64_t &high) {
     high ^= low;
     low = rotateLeft(low, 49) ^ high ^ (high << 21);
     high = rotateLeft(high, 28);
 }
 
-/**
- * @brief Returns the gate total for a climate value (times 2^24), like addClimate in hostgate.c
- * 
- * @param climate 0, 1 or 2 (humidity, erosion or weirdness)
- * @param seedLow The low random number of the seed
- * @param seedHigh The high one
- * @return float The total for this climate value
- */
-DEV float gateClimate(int climate, uint64_t seedLow, uint64_t seedHigh) {
-    XoroshiroState climateRandom;
-    climateRandom.low = seedLow ^ GATE_CLIMATE_SALTS[climate][0];
-    climateRandom.high = seedHigh ^ GATE_CLIMATE_SALTS[climate][1];
-    float total = 0;
+// The distance of an octave's y offset fraction from a half, from its generator already past the x offset (see gateTerm in hostgate.c)
+DEV uint32_t gateTerm(uint64_t low, uint64_t high) {
+    // only the high word of the output, without the carry out of the low word (it moves the fraction by at most one unit)
+    uint64_t sum = low + high;
+    uint32_t outputHigh = __funnelshift_l((uint32_t) sum, (uint32_t) (sum >> 32), 17) + (uint32_t) (low >> 32);
+    int32_t centered = (int32_t) (outputHigh & 0xFFFFFFu) - 0x800000;
+    return (uint32_t) abs(centered) >> 7;
+}
 
+// The two terms for one half of a climate value. first and second are the half's two numbers from the climate generator
+DEV uint32_t halfTerms(int climate, int half, uint64_t first, uint64_t second) {
+    gateStep(first, second); // skip the x offset, the octave salts are stepped already
+    uint32_t total = 0;
 #pragma unroll
-    for (int half = 0; half < 2; half++) {
-        uint64_t low = xNextLong(&climateRandom);
-        uint64_t high = xNextLong(&climateRandom);
-        xoroshiroStep(low, high); // skip the x offset
-
-#pragma unroll
-        for (int octave = 0; octave < 2; octave++) {
-            uint64_t octaveLow = low ^ GATE_STEPPED_SALTS[climate][octave][0];
-            uint64_t octaveHigh = high ^ GATE_STEPPED_SALTS[climate][octave][1];
-            uint64_t yRandom = rotateLeft(octaveLow + octaveHigh, 17) + octaveLow; // xNextLong, without the step after it
-            // how far the y offset's fraction is from a half
-            int distance = abs((int) ((uint32_t) (yRandom >> 32) & 0xFFFFFFu) - 0x800000);
-            total += GATE_WEIGHTS[climate][half][octave] * (float) distance;
-        }
+    for (int octave = 0; octave < 2; octave++) {
+        total += GATE_WEIGHTS[climate][half][octave] * gateTerm(first ^ GATE_STEPPED_SALTS[climate][octave][0], second ^ GATE_STEPPED_SALTS[climate][octave][1]);
     }
     return total;
 }
 
-// A seed that passed humidity, waiting for the erosion and weirdness part
-struct GateQueueEntry {
-    uint64_t index;
-    uint64_t seedLow;
-    uint64_t seedHigh;
-    float total;
+// Gives the lanes that keep going a slot in a shared queue, returns the slot (-1 for the others)
+DEV int queueSlot(bool keep, int *count) {
+    unsigned lanes = __ballot_sync(0xFFFFFFFFu, keep);
+    int lane = threadIdx.x & 31;
+    int leader = lanes ? __ffs(lanes) - 1 : 0;
+    int first = 0;
+    if (lanes && lane == leader) {
+        first = atomicAdd(count, __popc(lanes));
+    }
+    first = __shfl_sync(0xFFFFFFFFu, first, leader);
+    return keep ? first + __popc(lanes & ((1u << lane) - 1)) : -1;
+}
+
+// A seed that passed humidity, waiting for erosion and weirdness
+struct GateSurvivor {
+    uint32_t offset; // index minus the block's first index
+    uint32_t total;  // humidity's terms
+    uint64_t seedLow, seedHigh;
 };
 
 /**
- * @brief This kernel runs the gate on a batch of stream indexes, the indexes that pass get added to output (not in order).
- * The seeds that pass humidity go in a queue, then the block does erosion and weirdness for the queue
- * 
+ * @brief This kernel runs the gate on count stream indexes from first on. The ones that pass get added to output (not in order)
+ *
  * @param first The stream index to start at (with the custom seed offset added)
  * @param count The number of indexes to check
- * @param threshold The gate threshold times 2^24
- * @param humidityThreshold The humidity cut times 2^24
+ * @param cuts The cuts for each stage
  * @param output Where the indexes that pass go
  * @param outputCount The number of indexes that passed (it keeps going up past capacity)
  * @param capacity Room in output
  */
 __global__ void __launch_bounds__(GATE_THREADS)
-gateKernel(uint64_t first, uint32_t count, float threshold, float humidityThreshold, uint64_t *output, uint32_t *outputCount, uint32_t capacity) {
-    __shared__ GateQueueEntry queue[GATE_THREADS * GATE_ITEMS];
+gateKernel(uint64_t first, uint32_t count, GateCuts cuts, uint64_t *output, uint32_t *outputCount, uint32_t capacity) {
+    __shared__ GateSurvivor queue[GATE_THREADS * GATE_ROUND];
     __shared__ int queued;
-    if (threadIdx.x == 0) {
-        queued = 0;
-    }
-    __syncthreads();
+    const uint32_t blockFirst = blockIdx.x * (GATE_THREADS * GATE_ITEMS);
+    const uint32_t threadFirst = blockFirst + threadIdx.x * GATE_ITEMS;
+    uint64_t nextMix = mixStream(first + threadFirst);
 
-    // Humidity for all of the indexes
-    uint32_t blockFirst = blockIdx.x * (GATE_THREADS * GATE_ITEMS);
+#pragma unroll 1
+    for (int round = 0; round < GATE_ITEMS / GATE_ROUND; round++) {
+        if (threadIdx.x == 0) {
+            queued = 0;
+        }
+        __syncthreads();
+
 #pragma unroll
-    for (int item = 0; item < GATE_ITEMS; item++) {
-        uint32_t i = blockFirst + item * GATE_THREADS + threadIdx.x;
-        if (i < count) {
-            uint64_t index = first + i;
-            XoroshiroState random;
-            xSetSeed(&random, streamSeed(index));
-            uint64_t seedLow = xNextLong(&random);
-            uint64_t seedHigh = xNextLong(&random);
-            float total = gateClimate(0, seedLow, seedHigh);
-            if (total <= humidityThreshold) {
-                int slot = atomicAdd(&queued, 1);
-                queue[slot].index = index;
-                queue[slot].seedLow = seedLow;
-                queue[slot].seedHigh = seedHigh;
-                queue[slot].total = total;
+        for (int item = 0; item < GATE_ROUND; item++) {
+            uint32_t i = threadFirst + round * GATE_ROUND + item;
+            uint64_t mix = nextMix;
+            nextMix = mixStream(first + i + 1);
+            bool keep = false;
+            GateSurvivor entry;
+            if (i < count) {
+                seedNumbers(mix, nextMix, entry.seedLow, entry.seedHigh);
+                uint64_t low = entry.seedLow ^ GATE_CLIMATE_SALTS[0][0], high = entry.seedHigh ^ GATE_CLIMATE_SALTS[0][1];
+                uint64_t firstNumber = gateOutput(low, high);
+                gateStep(low, high);
+                uint64_t secondNumber = gateOutput(low, high);
+                gateStep(low, high);
+                uint32_t firstHalf = halfTerms(0, 0, firstNumber, secondNumber);
+                firstNumber = gateOutput(low, high);
+                gateStep(low, high);
+                secondNumber = gateOutput(low, high);
+                entry.total = firstHalf + halfTerms(0, 1, firstNumber, secondNumber);
+                entry.offset = i - blockFirst;
+                keep = firstHalf <= cuts.firstHalf && entry.total <= cuts.humidity;
+            }
+            int slot = queueSlot(keep, &queued);
+            if (keep) {
+                queue[slot] = entry;
             }
         }
-    }
-    __syncthreads();
+        __syncthreads();
 
-    // Then erosion and weirdness for the queue
-    int queueLength = queued;
-    for (int base = 0; base < queueLength; base += GATE_THREADS) {
-        int queueIndex = base + threadIdx.x;
-        bool passes = false;
-        uint64_t index = 0;
-        if (queueIndex < queueLength) {
-            GateQueueEntry entry = queue[queueIndex];
-            float total = entry.total + gateClimate(1, entry.seedLow, entry.seedHigh);
-            if (total <= threshold) {
-                total += gateClimate(2, entry.seedLow, entry.seedHigh);
+        // Erosion then weirdness for the seeds in the queue
+        int stageCount = queued;
+        for (int base = 0; base < stageCount; base += GATE_THREADS) {
+            int q = base + threadIdx.x;
+            bool passes = false;
+            uint64_t index = 0;
+            if (q < stageCount) {
+                GateSurvivor entry = queue[q];
+                index = first + blockFirst + entry.offset;
+                uint32_t total = entry.total;
+#pragma unroll
+                for (int climate = 1; climate < 3; climate++) {
+                    uint64_t low = entry.seedLow ^ GATE_CLIMATE_SALTS[climate][0], high = entry.seedHigh ^ GATE_CLIMATE_SALTS[climate][1];
+#pragma unroll
+                    for (int half = 0; half < 2; half++) {
+                        uint64_t firstNumber = gateOutput(low, high);
+                        gateStep(low, high);
+                        uint64_t secondNumber = gateOutput(low, high);
+                        gateStep(low, high);
+                        total += halfTerms(climate, half, firstNumber, secondNumber);
+                    }
+                    if (total > cuts.total) {
+                        break;
+                    }
+                }
+                passes = total <= cuts.total;
             }
-            passes = total <= threshold;
-            index = entry.index;
+            unsigned passedLanes = __ballot_sync(0xFFFFFFFFu, passes);
+            if (passedLanes) {
+                int lane = threadIdx.x & 31;
+                uint32_t warpFirst = 0;
+                if (lane == 0) {
+                    warpFirst = atomicAdd(outputCount, (uint32_t) __popc(passedLanes));
+                }
+                warpFirst = __shfl_sync(0xFFFFFFFFu, warpFirst, 0);
+                uint32_t slot = warpFirst + __popc(passedLanes & ((1u << lane) - 1));
+                if (passes && slot < capacity) {
+                    output[slot] = index;
+                }
+            }
         }
-
-        // Lane zero gets room in output for the warp, then the threads that passed write their indexes
-        unsigned passedLanes = __ballot_sync(0xFFFFFFFFu, passes);
-        if (passedLanes) {
-            int lane = threadIdx.x & 31;
-            uint32_t warpFirst = 0;
-            if (lane == 0) {
-                warpFirst = atomicAdd(outputCount, (uint32_t) __popc(passedLanes));
-            }
-            warpFirst = __shfl_sync(0xFFFFFFFFu, warpFirst, 0);
-            uint32_t slot = warpFirst + __popc(passedLanes & ((1u << lane) - 1));
-            if (passes && slot < capacity) {
-                output[slot] = index;
-            }
-        }
+        __syncthreads();
     }
 }
 
 /**
- * @brief This method does a xoroshiro step on the octave salts and copies the results to the GPU (for GATE_STEPPED_SALTS)
+ * @brief This method copies the salts and weights to the GPU. The octave salts get one xoroshiro step first (a step is just xors
+ * and shifts, so stepping the salt and the half's numbers seperately and xoring them is the same as stepping the xor)
  */
 static void uploadGpuGate() {
-    const uint64_t octaveSalts[3][2][2] = {
-        {{0x0ef68ec68504005eULL, 0x48b6bf93a2789640ULL}, {0xf11268128982754fULL, 0x257a1d670430b0aaULL}},  // Humidity
-        {{0x082fe255f8be6631ULL, 0x4e96119e22dedc81ULL}, {0x0ef68ec68504005eULL, 0x48b6bf93a2789640ULL}},  // Erosion
-        {{0xf11268128982754fULL, 0x257a1d670430b0aaULL}, {0xe51c98ce7d1de664ULL, 0x5f9478a733040c45ULL}}}; // Weirdness
     uint64_t stepped[3][2][2];
-
     for (int climate = 0; climate < 3; climate++) {
         for (int octave = 0; octave < 2; octave++) {
-            uint64_t low = octaveSalts[climate][octave][0], high = octaveSalts[climate][octave][1];
+            uint64_t low = GATE_OCTAVE_SALTS[climate][octave][0], high = GATE_OCTAVE_SALTS[climate][octave][1];
             high ^= low;
             low = ((low << 49) | (low >> 15)) ^ high ^ (high << 21);
             high = (high << 28) | (high >> 36);
@@ -166,4 +181,6 @@ static void uploadGpuGate() {
         }
     }
     cudaMemcpyToSymbol(GATE_STEPPED_SALTS, stepped, sizeof(stepped));
+    cudaMemcpyToSymbol(GATE_CLIMATE_SALTS, GATE_SALTS, sizeof(GATE_SALTS));
+    cudaMemcpyToSymbol(GATE_WEIGHTS, GATE_INT_WEIGHTS, sizeof(GATE_INT_WEIGHTS));
 }

@@ -1,7 +1,7 @@
 // JUNO (Just Use Noise Once), a GPU seed scanner for Minecraft 26.3.
 // Seeds go through the gate first (on the GPU, or in hostgate.c with --cpu-gate), then the temperature, humidity and probe kernels.
 // The cascade kernel counts the biomes for whatever is left, and the CPU checks the hits again at the end.
-#define JUNO_VERSION "1.2"
+#define JUNO_VERSION "1.3"
 #define BIOME_COUNT 52                   // surface biomes we score
 #define TEMPERATURE_THREADS 128          // Threads in a block for the temperature kernel
 #define STREAM_COUNT 5                   // Batches the GPU works on at once, each one gets a CUDA stream. Tried a few on my machine and 5 worked best, --streams changes it
@@ -72,12 +72,26 @@ __constant__ int STRIDE[LEVEL_COUNT] = {256, 128, 64, 32, 16, 8, 4, 2, 1};
 #define PROX_DISTANCE_SQ 4000000LL // how close a biome box has to be, squared
 #define PROX_LEVEL 3               // The cascade level where we check the gate
 
-// splitmix64 turns a stream index into a seed. hostgate.c does the same thing
+// The seed of a stream index (see STREAM_GOLDEN in hostgate.h). hostgate.c does the same thing
 DEV uint64_t streamSeed(uint64_t index) {
-    uint64_t mixed = index * 0x9E3779B97F4A7C15ULL;
+    return (index * STREAM_GOLDEN) ^ STREAM_SILVER;
+}
+
+// The mix xSetSeed does for a stream index: the low half of its seed's generator, and the high half of the index before it
+DEV uint64_t mixStream(uint64_t index) {
+    uint64_t mixed = index * STREAM_GOLDEN;
     mixed = (mixed ^ (mixed >> 30)) * 0xBF58476D1CE4E5B9ULL;
     mixed = (mixed ^ (mixed >> 27)) * 0x94D049BB133111EBULL;
     return mixed ^ (mixed >> 31);
+}
+
+// The seed's first two numbers (xSetSeed and two xNextLongs), from mixStream of its index and of the index after it
+DEV void seedNumbers(uint64_t low, uint64_t high, uint64_t &seedLow, uint64_t &seedHigh) {
+    seedLow = rotateLeft(low + high, 17) + low;
+    high ^= low;
+    low = rotateLeft(low, 49) ^ high ^ (high << 21);
+    high = rotateLeft(high, 28);
+    seedHigh = rotateLeft(low + high, 17) + low;
 }
 
 #include "cell_score.inc"
@@ -108,45 +122,6 @@ DEV int binAmount(uint64_t low, uint64_t high, int bin) {
 // Returns how many of the GPU gate's indexes are left from chunkFirst on (below zero past the end of the list)
 DEV long gatedLeft(const uint32_t *gatedCount, uint32_t chunkFirst) {
     return (long) min(*gatedCount, (uint32_t) BATCH_SIZE) - (long) chunkFirst;
-}
-
-/**
- * @brief This kernel shuffles the two temperature octaves in the shared tables and saves their corner slices for the temperature
- * kernel
- * 
- * @param indexes The stream indexes
- * @param indexCount How many indexes there are
- * @param built Where the corner slices go
- * @param gatedCount The number of indexes the GPU gate let through, NULL with --cpu-gate
- * @param chunkFirst Where this chunk starts in the list
- */
-__global__ void __launch_bounds__(TABLE_THREADS, TABLE_BLOCKS)
-temperatureBuildKernel(const uint64_t *indexes, int indexCount, uint64_t *built, const uint32_t *gatedCount = NULL, uint32_t chunkFirst = 0) {
-    __shared__ uint32_t tableWords[64 * TABLE_THREADS];
-    if (gatedCount) {
-        long left = gatedLeft(gatedCount, chunkFirst);
-        indexCount = (int) (left < indexCount ? left : indexCount);
-    }
-    // All the threads help with the shared tables, even the ones without a seed
-    int blockFirst = blockIdx.x * TABLE_THREADS;
-    if (blockFirst >= indexCount) {
-        return;
-    }
-    int i = blockFirst + threadIdx.x;
-    bool hasSeed = i < indexCount;
-
-    uint64_t halfLow[2], halfHigh[2];
-    climateHalves(streamSeed(indexes[hasSeed ? i : blockFirst]), 0x5c7e6b29735f0d7fULL, 0xf7d86f1bbc734988ULL, halfLow, halfHigh); // temperature salt
-    uint8_t *table = tableStart(tableWords);
-#pragma unroll 1
-    for (int half = 0; half < 2; half++) {
-        uint64_t slices[4];
-        HalfHeader header;
-        buildHalf(tableWords, table, half ? halfLow[1] : halfLow[0], half ? halfHigh[1] : halfHigh[0], 2, half, 10, 3, slices, &header);
-        if (hasSeed) {
-            saveBuiltHalf(built + i, 3, half, slices, header);
-        }
-    }
 }
 
 // Float copies of the score weights and log weights, uploadFloatTables fills them from the double ones
@@ -204,7 +179,8 @@ DEV float shareLogOf(int count) {
  * @param histogramTable HISTOGRAM_TABLE, copied to shared memory
  * @param gradients The gradient table in shared memory
  */
-DEV void filterTemperature(uint64_t seed, const uint64_t *built, uint32_t capacity, uint32_t *outputCount, uint64_t *records, const uint64_t *histogramTable, const GradientTable *gradients) {
+DEV void filterTemperature(uint64_t seed, const uint64_t *built, uint32_t capacity, uint32_t *outputCount, uint64_t *records, const uint64_t *histogramTable, const GradientTable *gradients,
+                              size_t stride = SHUFFLE_CHUNK) {
     // The temperature bands of the samples, 3 bits a sample and two rows to a word
     uint64_t rowBands[5] = {0, 0, 0, 0, 0};
 
@@ -215,7 +191,7 @@ DEV void filterTemperature(uint64_t seed, const uint64_t *built, uint32_t capaci
     uint32_t startRow[2];
 #pragma unroll
     for (int half = 0; half < 2; half++) {
-        readBuiltHalf(built, 3, half, slices[half], &halves[half]);
+        readBuiltHalf(built, 3, half, slices[half], &halves[half], stride);
         fillGridSteps(&columns[half], half, 10, halves[half].offsetX);
         startRow[half] = (halves[half].offsetZ + (uint32_t) GRID_POSITIONS[half][10][0]) >> 24;
     }
@@ -417,6 +393,8 @@ __constant__ float HUMID_BAND_EDGES[4];
 __constant__ float HUMID_NEAR_LOW[4];
 __constant__ float HUMID_NEAR_HIGH[4];
 
+#define HUMIDITY_THREADS 64 // threads in a block for the humidity kernel
+
 /**
  * @brief Samples humidity for the seed in a record, then checks the cell evenness and the cell score
  * 
@@ -427,7 +405,8 @@ __constant__ float HUMID_NEAR_HIGH[4];
  * @param outputSeeds Where the seeds that pass get written
  * @param outputProbe The start of the probe score for those seeds
  */
-DEV void filterHumidity(const uint64_t *record, const uint64_t *built, uint32_t capacity, uint32_t *outputCount, uint64_t *outputSeeds, double *outputProbe) {
+DEV void filterHumidity(const uint64_t *record, const uint64_t *built, uint32_t capacity, uint32_t *outputCount, uint64_t *outputSeeds, double *outputProbe,
+                        float2 *edgeScratch) {
     uint64_t seed = record[0];
     uint64_t rowBands[5];
     uint64_t tempBinsLow, tempBinsHigh;
@@ -461,21 +440,36 @@ DEV void filterHumidity(const uint64_t *record, const uint64_t *built, uint32_t 
         }
         uint32_t bandsThisRow = (uint32_t) (bandWord >> (27 * (row & 1)));
 
-        // Where this row is in z, and the corner slices on either side of it
-        float rowFraction[2], rowFade[2];
-        uint64_t nearZ[2], farZ[2];
+        // The slope and constant of every x edge of the cells this row goes through, into the thread's scratch in shared memory
 #pragma unroll
         for (int half = 0; half < 2; half++) {
             uint32_t noise = halves[half].offsetZ + (uint32_t) GRID_POSITIONS[half][8][row];
             int rowCell = (int) (uint8_t) ((noise >> 24) - startRow[half]);
-            rowFraction[half] = fractionOf(noise);
-            rowFade[half] = fade(rowFraction[half]);
-            nearZ[half] = slices[half][0];
-            farZ[half] = slices[half][1];
+            float rowFraction = fractionOf(noise);
+            float rowFade = fade(rowFraction);
+            uint64_t nearZ = slices[half][0], farZ = slices[half][1];
 #pragma unroll
             for (int z = 1; z < 6; z++) {
-                nearZ[half] = rowCell == z ? slices[half][z] : nearZ[half];
-                farZ[half] = rowCell == z ? slices[half][z + 1] : farZ[half];
+                nearZ = rowCell == z ? slices[half][z] : nearZ;
+                farZ = rowCell == z ? slices[half][z + 1] : farZ;
+            }
+#pragma unroll
+            for (int edge = 0; edge < 7; edge++) {
+                float zSlope[2], zConstant[2];
+#pragma unroll
+                for (int back = 0; back < 2; back++) {
+                    uint32_t slice = (uint32_t) ((back ? farZ : nearZ) >> (8 * edge));
+                    float lowX, lowY, lowZ, highX, highY, highZ;
+                    gradientVector(slice & 15, &lowX, &lowY, &lowZ);
+                    gradientVector((slice >> 4) & 15, &highX, &highY, &highZ);
+                    float alongZ = back == 0 ? rowFraction : rowFraction - 1.0f;
+                    zSlope[back] = interpolate(halves[half].yFade, lowX, highX);
+                    float low = fmaf(lowZ, alongZ, lowY * halves[half].yFraction);
+                    float high = fmaf(highZ, alongZ, highY * (halves[half].yFraction - 1.0f));
+                    zConstant[back] = interpolate(halves[half].yFade, low, high);
+                }
+                edgeScratch[(half * 7 + edge) * HUMIDITY_THREADS] =
+                    make_float2(interpolate(rowFade, zSlope[0], zSlope[1]), interpolate(rowFade, zConstant[0], zConstant[1]));
             }
         }
 
@@ -484,9 +478,11 @@ DEV void filterHumidity(const uint64_t *record, const uint64_t *built, uint32_t 
             float halfValues[2];
 #pragma unroll
             for (int half = 0; half < 2; half++) {
-                int shift = 8 * columns[half].cell[column];
-                halfValues[half] = sampleCorners(nearZ[half] >> shift, farZ[half] >> shift, columns[half].fraction[column], halves[half].yFraction,
-                                                 rowFraction[half], columns[half].fade[column], halves[half].yFade, rowFade[half]);
+                int cell = columns[half].cell[column];
+                float2 near = edgeScratch[(half * 7 + cell) * HUMIDITY_THREADS];
+                float2 far = edgeScratch[(half * 7 + cell + 1) * HUMIDITY_THREADS];
+                float fractionX = columns[half].fraction[column];
+                halfValues[half] = interpolate(columns[half].fade[column], fmaf(near.x, fractionX, near.y), fmaf(far.x, fractionX - 1.0f, far.y));
             }
             float humidity = (halfValues[0] + halfValues[1]) * (float) (1.0 * PERSISTENCE * (10.0 / 9));
             int humidBand = (humidity >= HUMID_BAND_EDGES[0]) + (humidity >= HUMID_BAND_EDGES[1]) + (humidity >= HUMID_BAND_EDGES[2])
@@ -594,7 +590,8 @@ DEV void filterHumidity(const uint64_t *record, const uint64_t *built, uint32_t 
  */
 __global__ void __launch_bounds__(TEMPERATURE_THREADS, TEMPERATURE_BLOCKS)
 temperatureKernel(const uint64_t *indexes, int indexCount, const uint64_t *built,
-                  uint32_t capacity, uint32_t *outputCount, uint64_t *records, const uint32_t *gatedCount = NULL, uint32_t chunkFirst = 0) {
+                  uint32_t capacity, uint32_t *outputCount, uint64_t *records, const uint32_t *gatedCount = NULL, uint32_t chunkFirst = 0,
+                  size_t stride = SHUFFLE_CHUNK) {
     // Leave right away if this chunk is past the end of the gate's list
     if (gatedCount && (long) blockIdx.x * blockDim.x >= gatedLeft(gatedCount, chunkFirst)) {
         return;
@@ -615,10 +612,230 @@ temperatureKernel(const uint64_t *indexes, int indexCount, const uint64_t *built
     if (i >= indexCount) {
         return;
     }
-    filterTemperature(streamSeed(indexes[i]), built + i, capacity, outputCount, records, histogramTable, &gradients);
+    filterTemperature(streamSeed(indexes[i]), built + i, capacity, outputCount, records, histogramTable, &gradients, stride);
 }
 
-#define HUMIDITY_THREADS 64
+// A separate build kernel would wait on the shuffle's arithmetic and leave the float units idle, and temperatureKernel spends most
+// of its time looking up gradients and the histogram table. So temperatureFusedKernel does both halves of the build and then a
+// first look at the bands straight from registers: the y pair of gradients at each lattice corner column folds into three floats
+// (CornerColumn), and a sample only needs a few multiply-adds and compares. Seeds with even enough bands go on to
+// temperatureKernel, which checks everything the old way. So does a seed with a sample so close to a band edge that the float
+// rounding here could have moved it, which keeps the records exactly the same as a build kernel and temperatureKernel give
+#define FUSED_EDGE_MARGIN 1e-5f
+// The seeds the fused kernel sends on pile up over a whole batch, and temperatureKernel runs once a batch (a chunk only gives it
+// about 33k seeds, less than one wave, so running it per chunk would pay for the latency of one seed each time). This is the
+// room for them, and the distance between a seed's words in evenBuilt
+#define EVEN_STRIDE ((size_t) 1 << 20)
+__constant__ float TEMPERATURE_BAND_EDGES[4] = {-0.45f, -0.15f, 0.2f, 0.55f};
+
+// The three numbers a lattice corner column (the two gradients at an x and z, one at each y) boils down to
+struct CornerColumn {
+    float slopeX;   // the gradients' x, mixed by the y fade
+    float slopeZ;   // the same for z
+    float constant; // gradient y times the offset from each corner's y, mixed the same way
+};
+
+// Gets corner column (x, z) of a half from its corner slices
+DEV CornerColumn cornerColumn(const uint64_t *slices, int x, int z, float fractionY, float fadeY) {
+    uint32_t lowHash = (uint32_t) (slices[z] >> (8 * x)) & 15;
+    uint32_t highHash = (uint32_t) (slices[z] >> (8 * x + 4)) & 15;
+    float lowX, lowY, lowZ, highX, highY, highZ;
+    gradientVector(lowHash, &lowX, &lowY, &lowZ);
+    gradientVector(highHash, &highX, &highY, &highZ);
+    CornerColumn column;
+    column.slopeX = interpolate(fadeY, lowX, highX);
+    column.slopeZ = interpolate(fadeY, lowZ, highZ);
+    column.constant = interpolate(fadeY, lowY * fractionY, highY * (fractionY - 1.0f));
+    return column;
+}
+
+// Picks columns[which] without indexing registers
+template <int Count>
+DEV CornerColumn pickColumn(const CornerColumn (&columns)[Count], int which) {
+    CornerColumn picked = columns[0];
+#pragma unroll
+    for (int k = 1; k < Count; k++) {
+        picked.slopeX = which == k ? columns[k].slopeX : picked.slopeX;
+        picked.slopeZ = which == k ? columns[k].slopeZ : picked.slopeZ;
+        picked.constant = which == k ? columns[k].constant : picked.constant;
+    }
+    return picked;
+}
+
+
+/**
+ * @brief The first look at a seed's temperature bands from its two halves' corner slices, all on the float pipes. Seeds
+ * that could pass temperatureKernel go to evenIndexes, with their slices in evenBuilt
+ */
+DEV void checkTemperatureBands(uint64_t index, const uint64_t *slices0, const uint64_t *slices1, HalfHeader header0, HalfHeader header1,
+                               uint64_t *evenBuilt, uint64_t *evenIndexes, uint32_t *evenCount) {
+    // The first half's grid always covers two lattice cells a side. The second half's covers two unless it starts in the last 1.8%
+    // of a cell, then it reaches a third one; those seeds (about 3.6%) just go on to the full check
+    CornerColumn columns0[3][3], columns1[3][3];
+#pragma unroll
+    for (int x = 0; x < 3; x++) {
+#pragma unroll
+        for (int z = 0; z < 3; z++) {
+            columns0[x][z] = cornerColumn(slices0, x, z, header0.yFraction, header0.yFade);
+            columns1[x][z] = cornerColumn(slices1, x, z, header1.yFraction, header1.yFade);
+        }
+    }
+
+    // Everything below runs on the float pipes (the shuffle keeps the ALU pipe busy): a pick between two cells is a blend with a 0
+    // or 1 weight, and a band count adds saturate((temperature - edge) * 10^5 + 0.5), which is 0 or 1 unless the sample is within
+    // 5e-6 of the edge. Then the count comes out fractional and the seed goes on to the full check
+    float columnFraction0[9], columnFade0[9], columnFraction1[9], columnFade1[9];
+    float firstInCell0 = 9, firstInCell1 = 9; // the first column in the second cell
+    bool wide = false;                        // the second half reaches a third cell
+    {
+        GridSteps steps;
+        fillGridSteps(&steps, 0, 10, header0.offsetX);
+#pragma unroll
+        for (int column = 8; column >= 0; column--) {
+            columnFraction0[column] = steps.fraction[column];
+            columnFade0[column] = steps.fade[column];
+            firstInCell0 = steps.cell[column] ? (float) column : firstInCell0;
+        }
+        fillGridSteps(&steps, 1, 10, header1.offsetX);
+#pragma unroll
+        for (int column = 8; column >= 0; column--) {
+            columnFraction1[column] = steps.fraction[column];
+            columnFade1[column] = steps.fade[column];
+            firstInCell1 = steps.cell[column] ? (float) column : firstInCell1;
+        }
+        wide = steps.cell[8] > 1;
+    }
+    uint32_t startRow0 = (header0.offsetZ + (uint32_t) GRID_POSITIONS[0][10][0]) >> 24;
+    uint32_t startRow1 = (header1.offsetZ + (uint32_t) GRID_POSITIONS[1][10][0]) >> 24;
+    wide = wide || (uint8_t) (((header1.offsetZ + (uint32_t) GRID_POSITIONS[1][10][8]) >> 24) - startRow1) > 1;
+    const float amplitude = (float) (1.5 * PERSISTENCE * (15.0 / 12));
+
+    float atLeast[4] = {0, 0, 0, 0};
+    float edgeOffsets[4];
+#pragma unroll
+    for (int edge = 0; edge < 4; edge++) {
+        edgeOffsets[edge] = 0.5f - TEMPERATURE_BAND_EDGES[edge] * 1e5f;
+    }
+#pragma unroll 1
+    for (int row = 0; row < 9; row++) {
+        uint32_t noise0 = header0.offsetZ + (uint32_t) GRID_POSITIONS[0][10][row];
+        uint32_t noise1 = header1.offsetZ + (uint32_t) GRID_POSITIONS[1][10][row];
+        float z0 = __saturatef((float) (int) (uint8_t) ((noise0 >> 24) - startRow0));
+        float z1 = __saturatef((float) (int) (uint8_t) ((noise1 >> 24) - startRow1));
+        float rowFraction0 = fractionOf(noise0), rowFade0 = fade(rowFraction0);
+        float rowFraction1 = fractionOf(noise1), rowFade1 = fade(rowFraction1);
+
+        // slope and constant (times the amplitude) of each x edge for this row
+        float slopes0[3], constants0[3], slopes1[3], constants1[3];
+#pragma unroll
+        for (int x = 0; x < 3; x++) {
+#pragma unroll
+            for (int half = 0; half < 2; half++) {
+                const CornerColumn &c0 = half ? columns1[x][0] : columns0[x][0];
+                const CornerColumn &c1 = half ? columns1[x][1] : columns0[x][1];
+                const CornerColumn &c2 = half ? columns1[x][2] : columns0[x][2];
+                float z = half ? z1 : z0, rowFraction = half ? rowFraction1 : rowFraction0, rowFade = half ? rowFade1 : rowFade0;
+                float nearSlopeX = fmaf(z, c1.slopeX - c0.slopeX, c0.slopeX), farSlopeX = fmaf(z, c2.slopeX - c1.slopeX, c1.slopeX);
+                float nearSlopeZ = fmaf(z, c1.slopeZ - c0.slopeZ, c0.slopeZ), farSlopeZ = fmaf(z, c2.slopeZ - c1.slopeZ, c1.slopeZ);
+                float nearConstant = fmaf(z, c1.constant - c0.constant, c0.constant), farConstant = fmaf(z, c2.constant - c1.constant, c1.constant);
+                float slope = amplitude * interpolate(rowFade, nearSlopeX, farSlopeX);
+                float constant = amplitude * interpolate(rowFade, fmaf(nearSlopeZ, rowFraction, nearConstant), fmaf(farSlopeZ, rowFraction - 1.0f, farConstant));
+                if (half) {
+                    slopes1[x] = slope;
+                    constants1[x] = constant;
+                } else {
+                    slopes0[x] = slope;
+                    constants0[x] = constant;
+                }
+            }
+        }
+
+#pragma unroll
+        for (int column = 0; column < 9; column++) {
+            float w0 = __saturatef((float) column - firstInCell0 + 1.0f), w1 = __saturatef((float) column - firstInCell1 + 1.0f);
+            float nearSlope0 = fmaf(w0, slopes0[1] - slopes0[0], slopes0[0]), farSlope0 = fmaf(w0, slopes0[2] - slopes0[1], slopes0[1]);
+            float nearConstant0 = fmaf(w0, constants0[1] - constants0[0], constants0[0]), farConstant0 = fmaf(w0, constants0[2] - constants0[1], constants0[1]);
+            float nearSlope1 = fmaf(w1, slopes1[1] - slopes1[0], slopes1[0]), farSlope1 = fmaf(w1, slopes1[2] - slopes1[1], slopes1[1]);
+            float nearConstant1 = fmaf(w1, constants1[1] - constants1[0], constants1[0]), farConstant1 = fmaf(w1, constants1[2] - constants1[1], constants1[1]);
+            float fraction0 = columnFraction0[column], fraction1 = columnFraction1[column];
+            float value0 = interpolate(columnFade0[column], fmaf(nearSlope0, fraction0, nearConstant0), fmaf(farSlope0, fraction0 - 1.0f, farConstant0));
+            float value1 = interpolate(columnFade1[column], fmaf(nearSlope1, fraction1, nearConstant1), fmaf(farSlope1, fraction1 - 1.0f, farConstant1));
+            float temperature = value0 + value1;
+#pragma unroll
+            for (int edge = 0; edge < 4; edge++) {
+                atLeast[edge] += __saturatef(fmaf(temperature, 1e5f, edgeOffsets[edge]));
+            }
+        }
+    }
+    float closest = wide ? 0.0f : 1.0f;
+#pragma unroll
+    for (int edge = 0; edge < 4; edge++) {
+        closest = atLeast[edge] != floorf(atLeast[edge]) ? 0.0f : closest;
+    }
+
+    int counts[5];
+    counts[0] = SAMPLE_COUNT - (int) atLeast[0];
+    counts[1] = (int) atLeast[0] - (int) atLeast[1];
+    counts[2] = (int) atLeast[1] - (int) atLeast[2];
+    counts[3] = (int) atLeast[2] - (int) atLeast[3];
+    counts[4] = (int) atLeast[3];
+    float entropy = 0;
+#pragma unroll
+    for (int band = 0; band < 5; band++) {
+        entropy += shareOf(counts[band]) * FLOAT_BAND_LOG_WEIGHTS[band] - shareLogOf(counts[band]);
+    }
+    if (entropy * FLOAT_INVERSE_LOG_TOTAL >= FLOAT_MIN_TEMPERATURE_EVENNESS || closest < FUSED_EDGE_MARGIN) {
+        uint32_t slot = atomicAdd(evenCount, 1u);
+        if (slot < EVEN_STRIDE) {
+            evenIndexes[slot] = index;
+            saveBuiltHalf(evenBuilt + slot, 3, 0, slices0, header0, EVEN_STRIDE);
+            saveBuiltHalf(evenBuilt + slot, 3, 1, slices1, header1, EVEN_STRIDE);
+        }
+    }
+}
+
+/**
+ * @brief This kernel builds both temperature halves (two shuffles in one loop) and takes a first look at the bands. The seeds
+ * that could pass temperatureKernel go to evenIndexes, with their corner slices in evenBuilt (at their slot, like built)
+ *
+ * @param indexes The stream indexes
+ * @param indexCount How many indexes there are
+ * @param evenBuilt Where the corner slices of the seeds that go on are saved
+ * @param evenIndexes Where their indexes go
+ * @param evenCount Counts them
+ * @param gatedCount The number of indexes the GPU gate let through, NULL with --cpu-gate
+ * @param chunkFirst Where this chunk starts in the list
+ */
+__global__ void __launch_bounds__(FUSED_THREADS, TABLE_BLOCKS)
+temperatureFusedKernel(const uint64_t *indexes, int indexCount, uint64_t *evenBuilt, uint64_t *evenIndexes, uint32_t *evenCount,
+                       const uint32_t *gatedCount = NULL, uint32_t chunkFirst = 0, const uint64_t *halfABuilt = NULL) {
+    __shared__ uint32_t tableWords[64 * TABLE_THREADS];
+    if (gatedCount) {
+        long left = gatedLeft(gatedCount, chunkFirst);
+        indexCount = (int) (left < indexCount ? left : indexCount);
+    }
+    // All the threads help with the shared tables, even the ones without a seed
+    int blockFirst = blockIdx.x * FUSED_THREADS;
+    if (blockFirst >= indexCount) {
+        return;
+    }
+    int i = blockFirst + threadIdx.x;
+    bool hasSeed = i < indexCount;
+    uint64_t index = indexes[hasSeed ? i : blockFirst];
+
+    uint64_t halfLow[2], halfHigh[2];
+    climateHalves(streamSeed(index), 0x5c7e6b29735f0d7fULL, 0xf7d86f1bbc734988ULL, halfLow, halfHigh); // temperature salt
+    uint64_t slices0[4], slices1[4];
+    HalfHeader header0, header1;
+    buildTwoHalves(tableWords, halfLow, halfHigh, 2, 10, 3, slices0, slices1, &header0, &header1);
+    if (!hasSeed) {
+        return;
+    }
+
+    checkTemperatureBands(index, slices0, slices1, header0, header1, evenBuilt, evenIndexes, evenCount);
+}
+
+
 
 /**
  * @brief This kernel checks the humidity of the seeds that passed the temperature kernel
@@ -631,14 +848,17 @@ temperatureKernel(const uint64_t *indexes, int indexCount, const uint64_t *built
  * @param outputSeeds Output for the seeds that pass
  * @param outputProbe Where the start of their probe score goes
  */
-__global__ void __launch_bounds__(HUMIDITY_THREADS)
+#define HUMIDITY_MIN_BLOCKS 1 // asking for more blocks on an SM would cap the registers (it uses 255)
+__global__ void __launch_bounds__(HUMIDITY_THREADS, HUMIDITY_MIN_BLOCKS)
 humidityKernel(const uint64_t *records, int recordCount, const uint64_t *built,
                uint32_t capacity, uint32_t *outputCount, uint64_t *outputSeeds, double *outputProbe) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= recordCount) {
         return;
     }
-    filterHumidity(records + (uint64_t) i * RECORD_WORDS, built + i, capacity, outputCount, outputSeeds, outputProbe);
+    __shared__ float2 edgeScratchAll[2 * 7 * HUMIDITY_THREADS];
+    float2 *edgeScratch = edgeScratchAll + threadIdx.x;
+    filterHumidity(records + (uint64_t) i * RECORD_WORDS, built + i, capacity, outputCount, outputSeeds, outputProbe, edgeScratch);
 }
 
 // The probe kernel adds continentalness and erosion onto the probe score from the humidity kernel,
@@ -697,7 +917,8 @@ DEV float sampleProbeOctave(const ProbeOctave &octave, int half, int lacunarityE
  * @param outputCount The number of seeds that passed
  * @param outputSeeds Where the seeds that pass go
  */
-__global__ void __launch_bounds__(TABLE_THREADS, 2) // 2 blocks on an SM at once
+#define PROBE_BLOCKS 3 // blocks on an SM at once, which caps the registers at 170 (faster than 2 with the edge tables)
+__global__ void __launch_bounds__(TABLE_THREADS, PROBE_BLOCKS)
 probeKernel(const uint64_t *seeds, const double *probeScores, int seedCount, uint32_t capacity, uint32_t *outputCount, uint64_t *outputSeeds) {
     __shared__ uint32_t tableWords[64 * TABLE_THREADS];
     int blockFirst = blockIdx.x * TABLE_THREADS;
@@ -734,24 +955,56 @@ probeKernel(const uint64_t *seeds, const double *probeScores, int seedCount, uin
         float mean = 0, squareSum = 0;
         float lowestValue = 1e9f, highestValue = -1e9f;
         uint64_t binsLow = 0, binsHigh = 0;
+        // The four octaves are shuffled, so the thread's table words are free until the next climate value: they hold the slope
+        // and constant of every x edge of a row (edge e at words 2e and 2e + 1). The lowest octave has 4 edges a half, the
+        // second 7: lowest 0-3 and 4-7, second 8-14 and 15-21
+        uint32_t *scratch = tableWords + threadIdx.x;
+#pragma unroll 1
         for (int row = 0; row < 9; row++) {
-            uint64_t lowestNear[2], lowestFar[2], secondNear[2], secondFar[2];
-            float lowestFraction[2], lowestFade[2], secondFraction[2], secondFade[2];
 #pragma unroll
-            for (int half = 0; half < 2; half++) {
-                probeRow(lowest[half], half, 9, 4, row, &lowestNear[half], &lowestFar[half], &lowestFraction[half], &lowestFade[half]);
-                probeRow(second[half], half, 8, 6, row, &secondNear[half], &secondFar[half], &secondFraction[half], &secondFade[half]);
+            for (int part = 0; part < 4; part++) {
+                const ProbeOctave &octave = part == 0 ? lowest[0] : part == 1 ? lowest[1] : part == 2 ? second[0] : second[1];
+                const int half = part & 1, lacunarityExponent = part < 2 ? 9 : 8, side = part < 2 ? 4 : 6, edges = side + 1;
+                const int firstEdge = part == 0 ? 0 : part == 1 ? 4 : part == 2 ? 8 : 15;
+                uint64_t nearZ, farZ;
+                float rowFraction, rowFade;
+                probeRow(octave, half, lacunarityExponent, side, row, &nearZ, &farZ, &rowFraction, &rowFade);
+#pragma unroll
+                for (int edge = 0; edge < edges && edge < 7; edge++) {
+                    float zSlope[2], zConstant[2];
+#pragma unroll
+                    for (int back = 0; back < 2; back++) {
+                        uint32_t slice = (uint32_t) ((back ? farZ : nearZ) >> (8 * edge));
+                        float lowX, lowY, lowZ, highX, highY, highZ;
+                        gradientVector(slice & 15, &lowX, &lowY, &lowZ);
+                        gradientVector((slice >> 4) & 15, &highX, &highY, &highZ);
+                        float alongZ = back == 0 ? rowFraction : rowFraction - 1.0f;
+                        zSlope[back] = interpolate(octave.header.yFade, lowX, highX);
+                        float low = fmaf(lowZ, alongZ, lowY * octave.header.yFraction);
+                        float high = fmaf(highZ, alongZ, highY * (octave.header.yFraction - 1.0f));
+                        zConstant[back] = interpolate(octave.header.yFade, low, high);
+                    }
+                    scratch[(2 * (firstEdge + edge)) * TABLE_THREADS] = __float_as_uint(interpolate(rowFade, zSlope[0], zSlope[1]));
+                    scratch[(2 * (firstEdge + edge) + 1) * TABLE_THREADS] = __float_as_uint(interpolate(rowFade, zConstant[0], zConstant[1]));
+                }
             }
 
 #pragma unroll
             for (int column = 0; column < 9; column++) {
-                float halfSums[2];
+                float halfSums[2] = {0, 0};
 #pragma unroll
-                for (int half = 0; half < 2; half++) {
-                    float sum = 0;
-                    sum += firstAmplitude * sampleProbeOctave(lowest[half], half, 9, column, lowestNear[half], lowestFar[half], lowestFraction[half], lowestFade[half]);
-                    sum += secondAmplitude * sampleProbeOctave(second[half], half, 8, column, secondNear[half], secondFar[half], secondFraction[half], secondFade[half]);
-                    halfSums[half] = sum;
+                for (int part = 0; part < 4; part++) {
+                    const ProbeOctave &octave = part == 0 ? lowest[0] : part == 1 ? lowest[1] : part == 2 ? second[0] : second[1];
+                    const int half = part & 1, lacunarityExponent = part < 2 ? 9 : 8;
+                    const int firstEdge = part == 0 ? 0 : part == 1 ? 4 : part == 2 ? 8 : 15;
+                    uint32_t noise = octave.header.offsetX + (uint32_t) GRID_POSITIONS[half][lacunarityExponent][column];
+                    int cell = (int) (uint8_t) ((noise >> 24) - octave.startColumn);
+                    float fraction = fractionOf(noise);
+                    int edge = 2 * (firstEdge + cell);
+                    float nearSlope = __uint_as_float(scratch[edge * TABLE_THREADS]), nearConstant = __uint_as_float(scratch[(edge + 1) * TABLE_THREADS]);
+                    float farSlope = __uint_as_float(scratch[(edge + 2) * TABLE_THREADS]), farConstant = __uint_as_float(scratch[(edge + 3) * TABLE_THREADS]);
+                    float sample = interpolate(fade(fraction), fmaf(nearSlope, fraction, nearConstant), fmaf(farSlope, fraction - 1.0f, farConstant));
+                    halfSums[half] += (part < 2 ? firstAmplitude : secondAmplitude) * sample;
                 }
                 float value = (halfSums[0] + halfSums[1]) * (float) noise.amplitude;
                 mean += value;
@@ -1177,7 +1430,7 @@ __global__ void cascadeKernel(const uint64_t *seeds, int seedCount, const uint8_
 // This part runs on the CPU
 
 #define DEFAULT_GATE_RATE 3.5       // Percent of the stream indexes the gate lets through
-#define HIGH_VALUE_GATE_RATE 7.0     // The rate high value mode uses with the gate on the GPU
+#define HIGH_VALUE_GATE_RATE 2.5     // The rate high value mode uses with the gate on the GPU (7 in v1.2, the 87+ rate is flat from 2 to 3)
 #define HIGH_VALUE_CPU_GATE_RATE 10.0 // and with --cpu-gate (the CPU gate can't keep up at 7)
 
 // The gate threshold that lets a percent of the stream indexes through. In between two of these it goes in a straight line
@@ -1189,7 +1442,7 @@ static const double GATE_RATES[][2] = {
     {20.00, 0.98626}, {22.00, 1.01569}, {25.00, 1.06775}};
 #define GATE_RATE_COUNT ((int) (sizeof(GATE_RATES) / sizeof(GATE_RATES[0])))
 
-static double gateThreshold = GATE_THRESHOLD; // main sets it from --gate-rate
+static GateCuts gateCuts; // the gate threshold as integers, with the cuts for the gate's stages (main sets it from --gate-rate)
 
 // Looks up the gate threshold for a rate (in percent)
 static double findGateThreshold(double rate) {
@@ -1200,6 +1453,29 @@ static double findGateThreshold(double rate) {
         }
     }
     return GATE_RATES[GATE_RATE_COUNT - 1][1];
+}
+
+// The integer cuts for the gate's stages at a rate (in percent). The two humidity cuts lose about 1 passing seed in 200 at 3%,
+// and none of the known seeds over ARBITRATIONS 86
+static GateCuts findGateCuts(double rate) {
+    static const double FIRST_HALF_CUTS[][2] = {{1, 0.32}, {2, 0.34}, {2.5, 0.36}, {3, 0.38}, {3.5, 0.40}, {7, 0.44}, {10, 0.48}, {25, 0.64}};
+    const int cutCount = (int) (sizeof(FIRST_HALF_CUTS) / sizeof(FIRST_HALF_CUTS[0]));
+    double firstHalf = FIRST_HALF_CUTS[cutCount - 1][1];
+    if (rate <= FIRST_HALF_CUTS[0][0]) {
+        firstHalf = FIRST_HALF_CUTS[0][1];
+    }
+    for (int i = 0; i + 1 < cutCount; i++) {
+        if (rate > FIRST_HALF_CUTS[i][0] && rate <= FIRST_HALF_CUTS[i + 1][0]) {
+            double part = (rate - FIRST_HALF_CUTS[i][0]) / (FIRST_HALF_CUTS[i + 1][0] - FIRST_HALF_CUTS[i][0]);
+            firstHalf = FIRST_HALF_CUTS[i][1] + part * (FIRST_HALF_CUTS[i + 1][1] - FIRST_HALF_CUTS[i][1]);
+        }
+    }
+    double threshold = findGateThreshold(rate);
+    GateCuts cuts;
+    cuts.total = (uint32_t) (threshold * GATE_SCALE);
+    cuts.humidity = (uint32_t) (std::min(threshold, 0.5) * GATE_SCALE);
+    cuts.firstHalf = (uint32_t) (std::min(threshold, firstHalf) * GATE_SCALE);
+    return cuts;
 }
 
 // Runs the CPU gate on worker threads. Batches are made of whole chunks, in order, since the checkpoint counts whole chunks.
@@ -1303,7 +1579,7 @@ struct GateProducer {
             passed.reserve((size_t) (chunkSize * passShare + 64));
             for (long offset = 0; offset < chunkSize; offset += PIECE_SIZE) {
                 long pieceSize = std::min((long) PIECE_SIZE, chunkSize - offset);
-                size_t passCount = gateIndexes(gateThreshold, firstIndex + (uint64_t) (start + offset), (size_t) pieceSize, pieceOutput.data());
+                size_t passCount = gateIndexes(gateCuts, firstIndex + (uint64_t) (start + offset), (size_t) pieceSize, pieceOutput.data());
                 passed.insert(passed.end(), pieceOutput.begin(), pieceOutput.begin() + (long) passCount);
             }
 
@@ -1402,8 +1678,7 @@ struct GateHelper {
     };
 
     long batchSpan;
-    float threshold;              // the GPU gate's cuts (times 2^24)
-    float humidityThreshold;
+    GateCuts cuts;                // the gate's cuts
     std::vector<Part *> parts;
     std::vector<Part *> freeParts;
     std::deque<Part *> scheduled; // in batch order
@@ -1427,14 +1702,12 @@ struct GateHelper {
      * @param rate The gate rate in percent
      * @param threads The number of threads
      * @param streams The number of batches the GPU works on at once
-     * @param gpuThreshold The GPU gate's threshold (times 2^24)
-     * @param gpuHumidityThreshold The GPU gate's humidity cut (times 2^24)
+     * @param gateCuts The gate's cuts
      */
-    GateHelper(long span, double rate, int threads, int streams, float gpuThreshold, float gpuHumidityThreshold) {
+    GateHelper(long span, double rate, int threads, int streams, GateCuts gateCuts) {
         batchSpan = span;
         threadCount = threads;
-        threshold = gpuThreshold;
-        humidityThreshold = gpuHumidityThreshold;
+        cuts = gateCuts;
         long capacity = (long) (0.8 * span * rate / 100.0 * 1.15) + 4096; // the biggest share plus some room
         for (int i = 0; i < LOOKAHEAD + streams + 2; i++) {
             Part *part = new Part();
@@ -1502,7 +1775,7 @@ struct GateHelper {
             auto started = std::chrono::steady_clock::now();
             long pieceStart = piece * (long) PIECE_SIZE;
             long pieceSize = std::min((long) PIECE_SIZE, part->size - pieceStart);
-            size_t passCount = floatGateIndexes(threshold, humidityThreshold, part->first + (uint64_t) pieceStart, (size_t) pieceSize,
+            size_t passCount = gateIndexes(cuts, part->first + (uint64_t) pieceStart, (size_t) pieceSize,
                                                   passedIndexes.data());
             long firstSlot = part->passed.fetch_add((long) passCount);
             if (firstSlot + (long) passCount <= part->capacity) {
@@ -1976,7 +2249,7 @@ static void uploadHighValueCutoffs() {
     double temperatureEvenness = 0.980;
     double temperatureScore = 2.0;
     double cellScore = 2.0;
-    double probeThreshold = 11.0;
+    double probeThreshold = 12.0; // keeps 66 of the 67 known seeds over ARBITRATIONS 86 and all the ones over 87
     double rankThresholds[5];
     double deepCutoffs[2] = {51.918, 52.918};
     cudaMemcpyFromSymbol(rankThresholds, RANK_THRESHOLD, sizeof(rankThresholds)); // level 1 keeps its cutoff
@@ -2120,6 +2393,9 @@ struct BatchSlot {
     double *probeScores;
     uint64_t *indexes;
     uint64_t *built;        // Where this slot's temperature and humidity build kernels save the corner slices
+    uint64_t *evenBuilt;    // The corner slices of the seeds temperatureFusedKernel sends on (the ones with even enough bands)
+    uint64_t *evenIndexes;  // and their stream indexes
+    uint32_t *evenCount;    // how many there are
     uint32_t *gatedCount;   // How many indexes the GPU gate let into this batch
     uint32_t *helperOffsets; // The CPU threads' part of the batch (with --cpu-assist)
     GateHelper::Part *helperPart = NULL; // Goes back to the helper when the batch is done
@@ -2150,6 +2426,29 @@ static uint32_t readCount(uint32_t *deviceCount, cudaStream_t stream) {
 }
 
 /**
+ * @brief Queues the temperature stage for a chunk of the batch's index list: the fused kernel builds the octaves and checks the
+ * bands, then temperatureKernel does the whole check for the seeds it sends on
+ * @param batch The batch slot
+ * @param chunkFirst Where the chunk starts in the batch's index list
+ * @param chunkSize Its size (the kernels cut it down to the gated count when that's on the GPU)
+ * @param gatedCount The GPU gate's count, NULL when the list came from the CPU
+ */
+static void queueTemperatureChunk(BatchSlot &batch, long chunkFirst, int chunkSize, const uint32_t *gatedCount) {
+    temperatureFusedKernel<<<(chunkSize + FUSED_THREADS - 1) / FUSED_THREADS, FUSED_THREADS, 0, batch.stream>>>(
+        batch.indexes + chunkFirst, chunkSize, batch.evenBuilt, batch.evenIndexes, batch.evenCount, gatedCount, (uint32_t) chunkFirst);
+}
+
+// The full temperature check for every seed the batch's chunks sent on, in one launch (see EVEN_STRIDE)
+static void startEvenCount(BatchSlot &batch) {
+    cudaMemsetAsync(batch.evenCount, 0, 4, batch.stream);
+}
+
+static void finishTemperatureEvens(BatchSlot &batch) {
+    temperatureKernel<<<(unsigned) ((EVEN_STRIDE + TEMPERATURE_THREADS - 1) / TEMPERATURE_THREADS), TEMPERATURE_THREADS, 0, batch.stream>>>(
+        batch.evenIndexes, (int) EVEN_STRIDE, batch.evenBuilt, (uint32_t) RECORD_CAPACITY, batch.passCount, batch.records, batch.evenCount, 0, EVEN_STRIDE);
+}
+
+/**
  * @brief Queues the temperature stage for a batch of gated stream indexes
  * @param batch The batch slot
  * @param hostIndexes The gated indexes
@@ -2164,16 +2463,13 @@ static void startTemperatureStage(BatchSlot &batch, const std::vector<uint64_t> 
     // Temperature kernel (saves the records), this doesn't wait for it
     cudaMemcpyAsync(batch.indexes, hostIndexes.data(), (size_t) indexCount * 8, cudaMemcpyHostToDevice, batch.stream);
     cudaMemsetAsync(batch.passCount, 0, 4, batch.stream);
+    startEvenCount(batch);
     for (long first = 0; first < indexCount; first += SHUFFLE_CHUNK) {
-        int chunkSize = (int) std::min((long) SHUFFLE_CHUNK, indexCount - first);
-        temperatureBuildKernel<<<(chunkSize + TABLE_THREADS - 1) / TABLE_THREADS, TABLE_THREADS, 0, batch.stream>>>(batch.indexes + first, chunkSize, batch.built);
-        temperatureKernel<<<(chunkSize + TEMPERATURE_THREADS - 1) / TEMPERATURE_THREADS, TEMPERATURE_THREADS, 0, batch.stream>>>(batch.indexes + first, chunkSize, batch.built,
-                                                                                                               (uint32_t) RECORD_CAPACITY, batch.passCount, batch.records);
+        queueTemperatureChunk(batch, first, (int) std::min((long) SHUFFLE_CHUNK, indexCount - first), NULL);
     }
+    finishTemperatureEvens(batch);
 }
 
-// The float gate thresholds for the GPU gate (times 2^24), main sets them
-static float gpuGateThreshold = 0, gpuGateHumidityThreshold = 0;
 static bool gpuGate = true; // false with --cpu-gate
 
 /**
@@ -2201,17 +2497,15 @@ static void startGateAndTemperature(BatchSlot &batch, uint64_t first, long span,
     for (long done = 0; done < gpuSpan; done += gateLaunch) {
         uint32_t count = (uint32_t) std::min(gateLaunch, gpuSpan - done);
         gateKernel<<<(count + GATE_THREADS * GATE_ITEMS - 1) / (GATE_THREADS * GATE_ITEMS), GATE_THREADS, 0, batch.stream>>>(
-            first + (uint64_t) done, count, gpuGateThreshold, gpuGateHumidityThreshold, batch.indexes, batch.gatedCount, (uint32_t) BATCH_SIZE);
+            first + (uint64_t) done, count, gateCuts, batch.indexes, batch.gatedCount, (uint32_t) BATCH_SIZE);
     }
 
     // The host doesn't know how many got through the gate, the kernels read the count themselves
+    startEvenCount(batch);
     for (long chunkFirst = 0; chunkFirst < BATCH_SIZE; chunkFirst += SHUFFLE_CHUNK) {
-        temperatureBuildKernel<<<(SHUFFLE_CHUNK + TABLE_THREADS - 1) / TABLE_THREADS, TABLE_THREADS, 0, batch.stream>>>(
-            batch.indexes + chunkFirst, SHUFFLE_CHUNK, batch.built, batch.gatedCount, (uint32_t) chunkFirst);
-        temperatureKernel<<<(SHUFFLE_CHUNK + TEMPERATURE_THREADS - 1) / TEMPERATURE_THREADS, TEMPERATURE_THREADS, 0, batch.stream>>>(
-            batch.indexes + chunkFirst, SHUFFLE_CHUNK, batch.built, (uint32_t) RECORD_CAPACITY, batch.passCount, batch.records, batch.gatedCount,
-            (uint32_t) chunkFirst);
+        queueTemperatureChunk(batch, chunkFirst, SHUFFLE_CHUNK, batch.gatedCount);
     }
+    finishTemperatureEvens(batch);
 }
 
 /**
@@ -2294,6 +2588,9 @@ static bool allocateBatchSlot(BatchSlot &batch, bool cpuAssist) {
     if (cudaMalloc(&batch.probeScores, BATCH_SIZE * 8) != cudaSuccess) { return false; }
     if (cudaMalloc(&batch.indexes, (size_t) BATCH_SIZE * 8) != cudaSuccess) { return false; }
     if (cudaMalloc(&batch.built, (size_t) SHUFFLE_CHUNK * BUILT_WORDS(6) * 8) != cudaSuccess) { return false; }
+    if (cudaMalloc(&batch.evenBuilt, EVEN_STRIDE * BUILT_WORDS(3) * 8) != cudaSuccess) { return false; }
+    if (cudaMalloc(&batch.evenIndexes, EVEN_STRIDE * 8) != cudaSuccess) { return false; }
+    if (cudaMalloc(&batch.evenCount, 4) != cudaSuccess) { return false; }
     if (cudaMalloc(&batch.gatedCount, 4) != cudaSuccess) { return false; }
     if (cpuAssist && cudaMalloc(&batch.helperOffsets, (size_t) BATCH_SIZE * 4) != cudaSuccess) { return false; }
     return true;
@@ -2401,7 +2698,7 @@ static void printUsage() {
            "  --cpu-assist                 The CPU threads gate part of every batch so the GPU gate has less to do (a bit faster,\n"
            "                               but it keeps the CPU busy)\n"
            "  --high-value                 Look for the best seeds (ARBITRATIONS 85 and up). The GPU filters get tighter and\n"
-           "                               the gate lets more through. You get a lot fewer hits, but the good ones show up\n"
+           "                               the gate gets narrower. You get a lot fewer hits, but the good ones show up\n"
            "                               a lot faster\n"
            "  --all-hits                   The wider filters, for all the hits from SENTS %.3f up (the default)\n"
            "  --prepare                    Only check the range and save the checkpoint, without scanning (make run does this)\n",
@@ -2627,7 +2924,7 @@ static bool isScanCommand(const std::vector<const char *> &words) {
  * @param settings The options the command line gave
  */
 static void applySettings(const Settings &settings) {
-    gateThreshold = findGateThreshold(settings.gateRate);
+    gateCuts = findGateCuts(settings.gateRate);
 
     // The GPU throws out hits that can't make the minimums. ARBITRATIONS is about 100 times SENTS squared, the 0.05 is some room
     double neededSents = settings.minSents;
@@ -3005,7 +3302,7 @@ int main(int argc, char **argv) {
     }
     printf("\n");
     if (settings.highValue) {
-        printf("Looking for the best seeds, the GPU filters are tighter and let very few hits under ARBITRATIONS 85 through\n");
+        printf("Looking for the best seeds, the GPU filters are tighter and let very few hits under ARBITRATIONS 84 through\n");
     }
 
     mkdir(RESULTS_FOLDER, 0755); // does nothing if it's already there
@@ -3072,8 +3369,6 @@ int main(int argc, char **argv) {
         gateThreads = 1;
     }
     gpuGate = !settings.cpuGate;
-    gpuGateThreshold = (float) (gateThreshold * 16777216.0);
-    gpuGateHumidityThreshold = (float) (std::min(gateThreshold, GATE_HUMIDITY_LIMIT) * 16777216.0);
     // A GPU gate batch covers enough of the stream to fill about 3/4 of a batch after the gate
     const long gpuSpan = (long) (0.75 * BATCH_SIZE / (settings.gateRate / 100.0));
     GateProducer *gate = NULL;
@@ -3085,7 +3380,7 @@ int main(int argc, char **argv) {
             if (helperThreads < 1) {
                 helperThreads = 1;
             }
-            gateHelper = new GateHelper(gpuSpan, settings.gateRate, helperThreads, settings.streams, gpuGateThreshold, gpuGateHumidityThreshold);
+            gateHelper = new GateHelper(gpuSpan, settings.gateRate, helperThreads, settings.streams, gateCuts);
             if (gateHelper->parts.empty()) {
                 printf("Couldn't get pinned memory for --cpu-assist, the GPU gates everything on its own\n");
                 delete gateHelper;
@@ -3093,8 +3388,8 @@ int main(int argc, char **argv) {
             } else {
                 gateHelper->schedule(offset + start, queued, rangeSize);
                 printf("Using %d CPU threads to help the GPU gate\n", helperThreads);
-                if (floatGateLanes() == 1) {
-                    printf("This CPU has neither AVX-512 nor AVX2 with FMA, so they can't help much\n");
+                if (gateLanes() == 1) {
+                    printf("This CPU doesn't have AVX-512, so they can't help much\n");
                 }
             }
         }
@@ -3102,10 +3397,8 @@ int main(int argc, char **argv) {
         gate = new GateProducer(offset + start + (uint64_t) finished, rangeSize - finished, gateThreads, settings.gateRate);
         if (gateLanes() == 8) {
             printf("Using %d threads for the CPU gate (with AVX-512), it lets %g%% of the indexes through\n", gateThreads, settings.gateRate);
-        } else if (gateLanes() == 4) {
-            printf("Using %d threads for the CPU gate (with AVX2), it lets %g%% of the indexes through\n", gateThreads, settings.gateRate);
         } else {
-            printf("Using %d threads for the CPU gate, it lets %g%% of the indexes through. This CPU has neither AVX-512 nor AVX2, so the gate is a lot slower\n",
+            printf("Using %d threads for the CPU gate, it lets %g%% of the indexes through. This CPU doesn't have AVX-512, so the gate is a lot slower\n",
                    gateThreads, settings.gateRate);
         }
     }
