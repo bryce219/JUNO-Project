@@ -1,42 +1,59 @@
-// The gate on the GPU. It adds up the same 12 terms as v1.2 (humidity, erosion and weirdness, the two lowest octaves of both
-// halves), in integers now, in two parts:
-//   1. humidity, both halves, for every index (two cuts: the first half's terms, then all of humidity)
-//   2. erosion, then weirdness, for the seeds left after humidity (about 28%), packed together in shared memory so the warps
-//      stay full
-// hostgate.c does exactly the same sums on the CPU (for --cpu-gate and --cpu-assist).
+// The gate from hostgate.c on the GPU, in integers. Humidity gets added up for all of the indexes, then erosion and
+// weirdness for the seeds that passed humidity (they go in a shared queue first to keep the warps full)
 #pragma once
 #include "hostgate.h"
 
 #define GATE_THREADS 256
-#define GATE_ITEMS 8 // indexes in a row that a thread starts with, the stream lets it reuse a mix for the next one
-#define GATE_ROUND 2 // how many of them go through a round (the queue holds GATE_THREADS * GATE_ROUND seeds)
+#define GATE_ITEMS 8 // How many indexes in a row a thread checks, the stream lets it reuse a mix for the next index
+#define GATE_ROUND 2 // How many of those go through the queue together
 
+// The climate salts from the CPU gate
 __constant__ uint64_t GATE_CLIMATE_SALTS[3][2];
-__constant__ uint64_t GATE_STEPPED_SALTS[3][2][2]; // the octave salts after one step, see uploadGpuGate
+
+// The octave salts from the CPU gate after a step forward. uploadGpuGate fills this in
+__constant__ uint64_t GATE_STEPPED_SALTS[3][2][2];
+
+// The weights from the CPU gate, [climate][half][octave]
 __constant__ uint32_t GATE_WEIGHTS[3][2][2];
 
+// Returns the number xoroshiro would give for this state
 DEV uint64_t gateOutput(uint64_t low, uint64_t high) {
     return rotateLeft(low + high, 17) + low;
 }
 
+// A xoroshiro step without making a number
 DEV void gateStep(uint64_t &low, uint64_t &high) {
     high ^= low;
     low = rotateLeft(low, 49) ^ high ^ (high << 21);
     high = rotateLeft(high, 28);
 }
 
-// The distance of an octave's y offset fraction from a half, from its generator already past the x offset (see gateTerm in hostgate.c)
+/**
+ * @brief Returns the distance between an octave's y offset fraction and a half, like gateTerm in hostgate.c
+ *
+ * @param low The low half of the octave's generator (past the x offset)
+ * @param high The high half
+ * @return uint32_t The distance from a half
+ */
 DEV uint32_t gateTerm(uint64_t low, uint64_t high) {
-    // only the high word of the output, without the carry out of the low word (it moves the fraction by at most one unit)
+    // The high half of the output, leaving out the carry from the low half (that barely changes the result)
     uint64_t sum = low + high;
     uint32_t outputHigh = __funnelshift_l((uint32_t) sum, (uint32_t) (sum >> 32), 17) + (uint32_t) (low >> 32);
     int32_t centered = (int32_t) (outputHigh & 0xFFFFFFu) - 0x800000;
     return (uint32_t) abs(centered) >> 7;
 }
 
-// The two terms for one half of a climate value. first and second are the half's two numbers from the climate generator
+/**
+ * @brief Returns the weighted gate terms for half of a climate value
+ *
+ * @param climate Which climate value (humidity, erosion then weirdness)
+ * @param half Which half of the climate value
+ * @param first The first random number for this half from the climate generator
+ * @param second The second random number
+ * @return uint32_t The total for this half
+ */
 DEV uint32_t halfTerms(int climate, int half, uint64_t first, uint64_t second) {
-    gateStep(first, second); // skip the x offset, the octave salts are stepped already
+    gateStep(first, second); // skip the x offset (the octave salts were stepped in uploadGpuGate)
     uint32_t total = 0;
 #pragma unroll
     for (int octave = 0; octave < 2; octave++) {
@@ -45,7 +62,13 @@ DEV uint32_t halfTerms(int climate, int half, uint64_t first, uint64_t second) {
     return total;
 }
 
-// Gives the lanes that keep going a slot in a shared queue, returns the slot (-1 for the others)
+/**
+ * @brief Gives a slot in the shared queue to the lanes of a warp that passed
+ *
+ * @param keep Whether or not this lane passed
+ * @param count The number of slots used so far
+ * @return int The lane's slot, or -1 if it didn't pass
+ */
 DEV int queueSlot(bool keep, int *count) {
     unsigned lanes = __ballot_sync(0xFFFFFFFFu, keep);
     int lane = threadIdx.x & 31;
@@ -60,17 +83,17 @@ DEV int queueSlot(bool keep, int *count) {
 
 // A seed that passed humidity, waiting for erosion and weirdness
 struct GateSurvivor {
-    uint32_t offset; // index minus the block's first index
-    uint32_t total;  // humidity's terms
+    uint32_t offset; // The index, counting from the block's first index
+    uint32_t total;  // The humidity total
     uint64_t seedLow, seedHigh;
 };
 
 /**
- * @brief This kernel runs the gate on count stream indexes from first on. The ones that pass get added to output (not in order)
+ * @brief This kernel runs the gate on a batch of stream indexes, and the indexes that pass get added to output (not in order)
  *
  * @param first The stream index to start at (with the custom seed offset added)
  * @param count The number of indexes to check
- * @param cuts The cuts for each stage
+ * @param cuts The gate cuts (see GateCuts in hostgate.h)
  * @param output Where the indexes that pass go
  * @param outputCount The number of indexes that passed (it keeps going up past capacity)
  * @param capacity Room in output
@@ -90,6 +113,7 @@ gateKernel(uint64_t first, uint32_t count, GateCuts cuts, uint64_t *output, uint
         }
         __syncthreads();
 
+        // Humidity for this thread's indexes, the ones that pass go in the queue
 #pragma unroll
         for (int item = 0; item < GATE_ROUND; item++) {
             uint32_t i = threadFirst + round * GATE_ROUND + item;
@@ -105,6 +129,7 @@ gateKernel(uint64_t first, uint32_t count, GateCuts cuts, uint64_t *output, uint
                 uint64_t secondNumber = gateOutput(low, high);
                 gateStep(low, high);
                 uint32_t firstHalf = halfTerms(0, 0, firstNumber, secondNumber);
+
                 firstNumber = gateOutput(low, high);
                 gateStep(low, high);
                 secondNumber = gateOutput(low, high);
@@ -120,13 +145,13 @@ gateKernel(uint64_t first, uint32_t count, GateCuts cuts, uint64_t *output, uint
         __syncthreads();
 
         // Erosion then weirdness for the seeds in the queue
-        int stageCount = queued;
-        for (int base = 0; base < stageCount; base += GATE_THREADS) {
-            int q = base + threadIdx.x;
+        int queueLength = queued;
+        for (int base = 0; base < queueLength; base += GATE_THREADS) {
+            int queueIndex = base + threadIdx.x;
             bool passes = false;
             uint64_t index = 0;
-            if (q < stageCount) {
-                GateSurvivor entry = queue[q];
+            if (queueIndex < queueLength) {
+                GateSurvivor entry = queue[queueIndex];
                 index = first + blockFirst + entry.offset;
                 uint32_t total = entry.total;
 #pragma unroll
@@ -146,6 +171,8 @@ gateKernel(uint64_t first, uint32_t count, GateCuts cuts, uint64_t *output, uint
                 }
                 passes = total <= cuts.total;
             }
+
+            // Add the indexes that passed to output, with an atomic add for the warp
             unsigned passedLanes = __ballot_sync(0xFFFFFFFFu, passes);
             if (passedLanes) {
                 int lane = threadIdx.x & 31;
@@ -165,8 +192,8 @@ gateKernel(uint64_t first, uint32_t count, GateCuts cuts, uint64_t *output, uint
 }
 
 /**
- * @brief This method copies the salts and weights to the GPU. The octave salts get one xoroshiro step first (a step is just xors
- * and shifts, so stepping the salt and the half's numbers seperately and xoring them is the same as stepping the xor)
+ * @brief This method copies the salts and weights to the GPU. The octave salts get stepped forward first, since a xoroshiro
+ * step is just xors and shifts (stepping the salt and the seed's numbers separately and xoring them gives you the stepped xor)
  */
 static void uploadGpuGate() {
     uint64_t stepped[3][2][2];
@@ -180,6 +207,7 @@ static void uploadGpuGate() {
             stepped[climate][octave][1] = high;
         }
     }
+
     cudaMemcpyToSymbol(GATE_STEPPED_SALTS, stepped, sizeof(stepped));
     cudaMemcpyToSymbol(GATE_CLIMATE_SALTS, GATE_SALTS, sizeof(GATE_SALTS));
     cudaMemcpyToSymbol(GATE_WEIGHTS, GATE_INT_WEIGHTS, sizeof(GATE_INT_WEIGHTS));

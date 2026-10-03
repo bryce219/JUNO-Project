@@ -49,10 +49,9 @@ DEV uint32_t multiplyHighAdd(uint32_t value, uint32_t multiplier, uint32_t add) 
     return result;
 }
 
-// A draw only feeds (draw * bound) >> 32, so the shuffles add low + high without the carry from the low word into the high word.
-// That puts the draw off by at most one, in about 1 step in 2^16, and a draw off by one changes the swap in about 1 case in 2^24
-// (it has to sit right under a multiple of 2^32 / bound): about one table in 2^31 comes out different. Multiplying by this (a
-// multiplier the compiler can't see) puts the two adds on the multiply-add pipe instead of the busy ALU pipe
+// Multiplying by PIPE_ONE puts an add on the multiply-add pipe, since the compiler can't tell what it is (the ALU pipe is the
+// busy pipe). The screening shuffles also leave out the carry from the low half of a draw into the high half, that almost never
+// changes an array. shuffleShared builds the cascade's arrays and does the whole add
 __constant__ uint32_t PIPE_ONE = 1;
 
 /**
@@ -82,7 +81,8 @@ DEV void shuffleShared(uint8_t *table, uint32_t *tableWords, XoroshiroState *ran
 #pragma unroll
         for (int part = 0; part < 4; part++) {
             uint32_t bound = 256 - (i + part);
-            uint32_t result = __funnelshift_l(lowHigh * PIPE_ONE + highHigh, lowLow * PIPE_ONE + highLow, 17) + lowLow;
+            uint64_t sum = ((uint64_t) lowHigh << 32 | lowLow) + ((uint64_t) highHigh << 32 | highLow);
+            uint32_t result = __funnelshift_l((uint32_t) (sum >> 32), (uint32_t) sum, 17) + lowLow;
             uint32_t xorLow = lowLow ^ highLow;
             uint32_t xorHigh = lowHigh ^ highHigh;
             uint32_t nextLowLow = xor3(__funnelshift_r(lowLow, lowHigh, 15), xorLow, xorLow << 21);
@@ -125,23 +125,22 @@ DEV void shuffleShared(uint8_t *table, uint32_t *tableWords, XoroshiroState *ran
 // The number of 64 bit words a build kernel saves for a seed (the corner slices of both halves, then the two headers)
 #define BUILT_WORDS(side) (2 * ((side) + 1) + 4)
 
-// Multipliers the compiler can't see, so the shuffle's bound and its address math run on the multiply-add pipe (the ALU pipe is the
-// busy one)
+// More multipliers the compiler can't see through, they move the shuffle's bound and address math onto the multiply-add pipe
 __constant__ int32_t PIPE_MINUS_ONE = -1;
 __constant__ uint32_t PIPE_QUARTER = 1u << 30;
 
-// A thread's table is 64 words, each with four entries in a row, and the words are TABLE_THREADS apart. So the lanes of a warp always
-// hit their own banks, and the shuffle can write four finished entries with one store
+// A thread's array is a column of words with 4 entries in a word, and the words are TABLE_THREADS apart. That way the lanes of
+// a warp hit their own banks, and the shuffle can store a word of finished entries in a single write
 DEV uint8_t *tableStart(uint32_t *tableWords) {
     return (uint8_t *) (tableWords + threadIdx.x);
 }
 
-// Where entry position is, from tableStart
+// Returns where entry position is, starting from tableStart
 DEV uint32_t tableOffset(uint32_t position) {
     return (position >> 2) * (TABLE_THREADS * 4) + (position & 3);
 }
 
-// Fills all of a block's tables with 0 to 255. All 128 threads have to call this
+// Fills all of the block's arrays with 0 to 255 (all of the threads in the block have to call this)
 DEV void resetTables(uint32_t *tableWords) {
     uint4 *quads = (uint4 *) tableWords;
     for (int quad = threadIdx.x; quad < 16 * TABLE_THREADS; quad += TABLE_THREADS) {
@@ -150,7 +149,7 @@ DEV void resetTables(uint32_t *tableWords) {
     }
 }
 
-// Entry position of a thread's table (the position wraps around at 256)
+// Returns entry position of a thread's array (position wraps around)
 DEV uint32_t tableEntry(const uint8_t *table, uint32_t position) {
     return table[tableOffset(position & 255)];
 }
@@ -163,10 +162,9 @@ struct SplitRandom {
     uint32_t highHigh;
 };
 
-// Returns the low 32 bits of xNextLong (all xNextInt needs)
-
+// Returns the low 32 bits of xNextLong (that's all xNextInt needs)
 DEV uint32_t nextLowWord(SplitRandom &random) {
-    uint32_t sumLow = random.lowLow * PIPE_ONE + random.highLow;   // two plain adds on the multiply-add pipe, no carry
+    uint32_t sumLow = random.lowLow * PIPE_ONE + random.highLow;   // plain adds on the multiply-add pipe, with no carry
     uint32_t sumHigh = random.lowHigh * PIPE_ONE + random.highHigh;
     uint32_t result = __funnelshift_l(sumHigh, sumLow, 17) + random.lowLow; // the low word of rotateLeft(sum, 17)
     uint32_t xorLow = random.lowLow ^ random.highLow;
@@ -181,8 +179,8 @@ DEV uint32_t nextLowWord(SplitRandom &random) {
 }
 
 /**
- * @brief Shuffles a thread's table the way Minecraft does, like shuffleShared, except that it ignores xNextInt's redraw (a
- * draw gets redone when the low word of draw * bound is under the bound, which changes about 3 tables in 100,000)
+ * @brief Shuffles a thread's array the way Minecraft does, like shuffleShared, but it skips xNextInt's redraw (that hardly
+ * ever changes the result)
  * 
  * @param table The thread's table (see tableStart), it has to hold 0 to 255 already
  * @param random The octave's random generator (after the offsets)
@@ -194,8 +192,8 @@ DEV void shuffleTable(uint8_t *table, XoroshiroState random) {
     split.highLow = (uint32_t) random.high;
     split.highHigh = (uint32_t) (random.high >> 32);
 
-    // Entry i is done once step i swaps it, and nothing reads it again until the shuffle is over. So a step only writes the entry it
-    // swaps with, and the finished entries go out four at a time
+    // Entry i is finished when step i swaps it, and nothing reads it again in this shuffle. A step just writes the entry it swaps
+    // with, and the finished entries get stored a word at a time
     uint8_t *row = table; // entry i
 #pragma unroll 1
     for (int i = 0; i < 256; i += 16, row += 16 * TABLE_THREADS) {
@@ -206,7 +204,7 @@ DEV void shuffleTable(uint8_t *table, XoroshiroState random) {
             for (int part = 4 * word; part < 4 * word + 4; part++) {
                 uint32_t bound = (uint32_t) (i * PIPE_MINUS_ONE + (256 - part));
                 uint32_t result = nextLowWord(split);
-                // The entry to swap with, as a distance from entry i (i is a multiple of 4, so tableOffset works on the distance)
+                // The entry to swap with, as a distance from entry i (tableOffset works on the distance since i is a multiple of 4)
                 uint32_t distance = multiplyHighAdd(result, bound, part);
                 uint32_t quarter = __umulhi(distance, PIPE_QUARTER); // distance >> 2
                 uint8_t *other = row + (distance + quarter * (TABLE_THREADS * 4 - 4));
@@ -255,8 +253,8 @@ DEV void cornerSlices(const uint8_t *table, uint32_t startX, uint32_t latticeY, 
 /**
  * @brief Shuffles the octave for one half of a climate value in the thread's table and gets its corner slices
  * 
- * @param tableWords
- * @param table
+ * @param tableWords The block's shared arrays
+ * @param table The thread's array (see tableStart)
  * @param halfLow The low random number of the half
  * @param halfHigh The high one
  * @param saltIndex Where the octave's salt is in OCTAVE_SALTS
@@ -288,52 +286,73 @@ DEV void buildHalf(uint32_t *tableWords, uint8_t *table, uint64_t halfLow, uint6
     cornerSlices(table, startX, (uint32_t) (yRandom >> 56), startZ, side, slices);
 }
 
-// Both halves' shuffles in one loop, two independent xoroshiro chains a thread for the scheduler to overlap. The tables sit in
-// slots t and t + 64 of the usual 128-slot block, so a block has 64 threads and the same shared memory. Like shuffleTable it
-// ignores xNextInt's redraw
+// Threads in a block for the kernels that shuffle the halves together (a thread gets two of the array slots)
 #define FUSED_THREADS (TABLE_THREADS / 2)
 
-DEV void shuffleTwoTables(uint8_t *tableA, uint8_t *tableB, XoroshiroState randomA, XoroshiroState randomB) {
-    SplitRandom splitA, splitB;
-    splitA.lowLow = (uint32_t) randomA.low;
-    splitA.lowHigh = (uint32_t) (randomA.low >> 32);
-    splitA.highLow = (uint32_t) randomA.high;
-    splitA.highHigh = (uint32_t) (randomA.high >> 32);
-    splitB.lowLow = (uint32_t) randomB.low;
-    splitB.lowHigh = (uint32_t) (randomB.low >> 32);
-    splitB.highLow = (uint32_t) randomB.high;
-    splitB.highHigh = (uint32_t) (randomB.high >> 32);
-    uint8_t *rowA = tableA, *rowB = tableB;
+/**
+ * @brief Shuffles the arrays for the halves of a climate value in a single loop, like shuffleTable does for a single
+ * array. The two xoroshiro chains are independent, the scheduler can overlap them
+ *
+ * @param table0 The first half's array
+ * @param table1 The second half's array
+ * @param random0 The first half's octave generator (after the offsets)
+ * @param random1 The second half's
+ */
+DEV void shuffleTwoTables(uint8_t *table0, uint8_t *table1, XoroshiroState random0, XoroshiroState random1) {
+    SplitRandom split0, split1;
+    split0.lowLow = (uint32_t) random0.low;
+    split0.lowHigh = (uint32_t) (random0.low >> 32);
+    split0.highLow = (uint32_t) random0.high;
+    split0.highHigh = (uint32_t) (random0.high >> 32);
+    split1.lowLow = (uint32_t) random1.low;
+    split1.lowHigh = (uint32_t) (random1.low >> 32);
+    split1.highLow = (uint32_t) random1.high;
+    split1.highHigh = (uint32_t) (random1.high >> 32);
+    uint8_t *row0 = table0, *row1 = table1;
 #pragma unroll 1
-    for (int i = 0; i < 256; i += 16, rowA += 16 * TABLE_THREADS, rowB += 16 * TABLE_THREADS) {
+    for (int i = 0; i < 256; i += 16, row0 += 16 * TABLE_THREADS, row1 += 16 * TABLE_THREADS) {
 #pragma unroll
         for (int word = 0; word < 4; word++) {
-            uint32_t finishedA = 0, finishedB = 0;
+            uint32_t finished0 = 0, finished1 = 0;
 #pragma unroll
             for (int part = 4 * word; part < 4 * word + 4; part++) {
                 uint32_t bound = (uint32_t) (i * PIPE_MINUS_ONE + (256 - part));
-                uint32_t resultA = nextLowWord(splitA);
-                uint32_t resultB = nextLowWord(splitB);
-                uint32_t distanceA = multiplyHighAdd(resultA, bound, part);
-                uint32_t distanceB = multiplyHighAdd(resultB, bound, part);
-                uint8_t *otherA = rowA + (distanceA + __umulhi(distanceA, PIPE_QUARTER) * (TABLE_THREADS * 4 - 4));
-                uint8_t *otherB = rowB + (distanceB + __umulhi(distanceB, PIPE_QUARTER) * (TABLE_THREADS * 4 - 4));
-                uint8_t currentA = rowA[(part >> 2) * (TABLE_THREADS * 4) + (part & 3)];
-                uint8_t currentB = rowB[(part >> 2) * (TABLE_THREADS * 4) + (part & 3)];
-                uint8_t swappedA = *otherA;
-                uint8_t swappedB = *otherB;
-                *otherA = currentA;
-                *otherB = currentB;
-                finishedA = (uint32_t) swappedA * (1u << (8 * (part & 3))) + finishedA;
-                finishedB = (uint32_t) swappedB * (1u << (8 * (part & 3))) + finishedB;
+                uint32_t result0 = nextLowWord(split0);
+                uint32_t result1 = nextLowWord(split1);
+                uint32_t distance0 = multiplyHighAdd(result0, bound, part);
+                uint32_t distance1 = multiplyHighAdd(result1, bound, part);
+                uint8_t *other0 = row0 + (distance0 + __umulhi(distance0, PIPE_QUARTER) * (TABLE_THREADS * 4 - 4));
+                uint8_t *other1 = row1 + (distance1 + __umulhi(distance1, PIPE_QUARTER) * (TABLE_THREADS * 4 - 4));
+                uint8_t current0 = row0[(part >> 2) * (TABLE_THREADS * 4) + (part & 3)];
+                uint8_t current1 = row1[(part >> 2) * (TABLE_THREADS * 4) + (part & 3)];
+                uint8_t swapped0 = *other0;
+                uint8_t swapped1 = *other1;
+                *other0 = current0;
+                *other1 = current1;
+                finished0 = (uint32_t) swapped0 * (1u << (8 * (part & 3))) + finished0;
+                finished1 = (uint32_t) swapped1 * (1u << (8 * (part & 3))) + finished1;
             }
-            *(uint32_t *) (rowA + word * (TABLE_THREADS * 4)) = finishedA;
-            *(uint32_t *) (rowB + word * (TABLE_THREADS * 4)) = finishedB;
+            *(uint32_t *) (row0 + word * (TABLE_THREADS * 4)) = finished0;
+            *(uint32_t *) (row1 + word * (TABLE_THREADS * 4)) = finished1;
         }
     }
 }
 
-// buildHalf for both halves at once (the whole block calls it: it resets all 128 table slots)
+/**
+ * @brief Builds the octave for the halves of a climate value at once, like buildHalf does for a single half. All of the
+ * block's threads have to call this (it resets all of the array slots)
+ *
+ * @param tableWords The block's shared arrays
+ * @param halfLow The low random numbers of the halves
+ * @param halfHigh The high ones
+ * @param saltIndex Where the octave's salt is in OCTAVE_SALTS
+ * @param lacunarityExponent The octave's lacunarity is 2 to the minus this
+ * @param side Cells on a side of the block the grid can touch
+ * @param slices0 Gets the first half's corner slices
+ * @param slices1 Gets the second half's
+ * @param header0 Gets the first half's offsets, y fraction and y fade
+ * @param header1 Gets the second half's
+ */
 DEV void buildTwoHalves(uint32_t *tableWords, const uint64_t *halfLow, const uint64_t *halfHigh, int saltIndex, int lacunarityExponent, int side,
                         uint64_t *slices0, uint64_t *slices1, HalfHeader *header0, HalfHeader *header1) {
     XoroshiroState random[2];
@@ -347,6 +366,8 @@ DEV void buildTwoHalves(uint32_t *tableWords, const uint64_t *halfLow, const uin
         yRandom[half] = xNextLong(&random[half]);
         headers[half]->offsetZ = octaveOffset(xNextLong(&random[half]));
     }
+
+    // Reset all of the arrays, then shuffle
     __syncthreads();
     uint4 *quads = (uint4 *) tableWords;
     for (int quad = threadIdx.x; quad < 16 * TABLE_THREADS; quad += FUSED_THREADS) {
@@ -354,15 +375,17 @@ DEV void buildTwoHalves(uint32_t *tableWords, const uint64_t *halfLow, const uin
         quads[quad] = make_uint4(entry, entry, entry, entry);
     }
     __syncthreads();
-    uint8_t *tableA = (uint8_t *) (tableWords + threadIdx.x), *tableB = (uint8_t *) (tableWords + threadIdx.x + FUSED_THREADS);
-    shuffleTwoTables(tableA, tableB, random[0], random[1]);
+    uint8_t *table0 = (uint8_t *) (tableWords + threadIdx.x), *table1 = (uint8_t *) (tableWords + threadIdx.x + FUSED_THREADS);
+    shuffleTwoTables(table0, table1, random[0], random[1]);
+
+    // Look up the corner slices for the halves
 #pragma unroll
     for (int half = 0; half < 2; half++) {
         headers[half]->yFraction = fractionOf(octaveOffset(yRandom[half]));
         headers[half]->yFade = fade(headers[half]->yFraction);
         uint32_t startX = (headers[half]->offsetX + (uint32_t) GRID_POSITIONS[half][lacunarityExponent][0]) >> 24;
         uint32_t startZ = (headers[half]->offsetZ + (uint32_t) GRID_POSITIONS[half][lacunarityExponent][0]) >> 24;
-        cornerSlices(half ? tableB : tableA, startX, (uint32_t) (yRandom[half] >> 56), startZ, side, half ? slices1 : slices0);
+        cornerSlices(half ? table1 : table0, startX, (uint32_t) (yRandom[half] >> 56), startZ, side, half ? slices1 : slices0);
     }
 }
 
@@ -381,7 +404,7 @@ DEV void climateHalves(uint64_t seed, uint64_t saltLow, uint64_t saltHigh, uint6
     halfHigh[1] = xNextLong(&climateRandom);
 }
 
-// Saves a half's corner slices and header for a seed (built is the seed's first word, the next ones are SHUFFLE_CHUNK apart)
+// Saves a half's corner slices and header for a seed (built is the seed's first word, and the next ones are stride apart)
 DEV void saveBuiltHalf(uint64_t *built, int side, int half, const uint64_t *slices, const HalfHeader &header, size_t stride = SHUFFLE_CHUNK) {
     for (int z = 0; z <= side; z++) {
         built[(size_t) (half * (side + 1) + z) * stride] = slices[z];

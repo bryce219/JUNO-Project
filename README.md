@@ -99,7 +99,7 @@ That compiles the cubiomes files, the CPU gate and the scanner in the `cuda` fol
 
 By default it builds for an RTX 40 series card (`sm_89`). For another card use `ARCH` with your card's compute capability, e.g. `make ARCH=sm_86` for the 30 series. It remembers the card (even after `make clean`), so you only have to do that once. You'll want about 6 GB of free GPU memory, or about 1.5 GB with `--streams 1` (it's slower though).
 
-Build it on the computer you're going to run it on, the CPU gate (for `--cpu-gate` and `--cpu-assist`) gets compiled with `-march=native`. If your CPU doesn't have AVX-512 the gate falls back to a slower version (when the scanner starts it writes which one it's using to `results/gpu_scan.log`). That one keeps a few more seeds and is several times slower per thread.
+Build it on the computer you're going to run it on, the CPU gate (for `--cpu-gate` and `--cpu-assist`) gets compiled with `-march=native`. If your CPU doesn't have AVX-512 the gate uses AVX2, which checks 4 seeds at a time instead of 8, and if it has neither the gate checks them one at a time and is a lot slower (when the scanner starts it writes which one it's using to `results/gpu_scan.log`). All of them keep the same seeds.
 
 ## Running
 ```sh
@@ -241,7 +241,7 @@ Each hit is one JSON line:
 - `make stop` and `make status` only look at the copy of JUNO they're run in (they go by the folder a process runs in). The lock only knows about JUNO scanners, so `make run` and the supervisor also won't start a scanner while any other program called `scan` is running.
 - `make score`, `make top` and `make test` run the same `scan` program. While one of them is going, `make run` says JUNO is already running, `make status` shows the scanner as running, the supervisor won't restart a crashed scanner, and `make stop` stops it (a long `make score` just gets cut off). They're usually done in a few seconds.
 - The scanner uses the first GPU. You can pick a different one with `CUDA_VISIBLE_DEVICES`.
-- Without AVX-512 the CPU gate is a lot slower (see Building it).
+- Without AVX-512 the CPU gate is about half as fast, and without AVX2 as well it's a lot slower (see Building it).
 - The CPU checks one hit for each of its threads at a time. With a fast GPU and a slow CPU the GPU ends up waiting for it, and `--min-sents` or `--high-value` gives it fewer hits to check.
 
 ## Performance
@@ -251,6 +251,7 @@ On my Ryzen 9 7950X3D and RTX 4080 SUPER the scanner gets through about 11.9 bil
 - Cubitect, for cubiomes, which all of the biome generation here is built on.
 - arb4096: the idea behind the offset gate comes from the crunch filter in arb4096_crunch_final, and the temperature band edges and the idea of weighting the bands by how many biomes they hold come from their HIP biome scanner.
 - The 26.3 biome tree comes from the cubiomes fork that shipped with the HIP scanner.
+- Shawn Xu (@xu-shawn) found the temperature pre-check and the redraw skip on his own in #8, and his numbers held up when I re-ran them.
 
 ## License
 MIT, see `LICENSE`. cubiomes keeps its own MIT licence in `vendor/cubiomes/LICENSE`.

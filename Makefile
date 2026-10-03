@@ -44,7 +44,7 @@ cuda/genlut: cuda/genlut.c $(CUBIOMES)
 cuda/lut263.bin: | cuda/genlut
 	cd cuda && ./genlut
 
-# CPU gate (-march=native turns on AVX-512 if your CPU has it)
+# CPU gate (-march=native turns on AVX-512 or AVX2 if your CPU has them)
 cuda/hostgate.o: cuda/hostgate.c cuda/hostgate.h
 	gcc -O3 -march=native -I$(CUB) -c -o $@ cuda/hostgate.c
 
