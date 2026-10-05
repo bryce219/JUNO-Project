@@ -632,15 +632,15 @@ temperatureKernel(const uint64_t *indexes, int indexCount, const uint64_t *built
 
 // temperatureKernel runs on the seeds the fused kernel sends on from a group of chunks (one chunk doesn't give it enough seeds to
 // fill the GPU). EVEN_STRIDE is the room for a group's seeds, and the distance between a seed's words in evenBuilt. A group
-// sends on around a fifth of its seeds at the most (with the default settings), and the ones that don't fit get counted
+// sends on around a fifth of its seeds at the most (with the default settings), and this leaves room for over a third
 #define EVEN_GROUP_CHUNKS 4
-#define EVEN_STRIDE ((size_t) SHUFFLE_CHUNK)
+#define EVEN_STRIDE ((size_t) SHUFFLE_CHUNK * 3 / 2)
 static_assert(EVEN_STRIDE * BUILT_WORDS(3) <= SHUFFLE_CHUNK * BUILT_WORDS(6), "evenBuilt shares built's memory, so it has to fit in it");
 
 // The temperature band edges, as floats
 __constant__ float TEMPERATURE_BAND_EDGES[4] = {-0.45f, -0.15f, 0.2f, 0.55f};
 
-// What a lattice corner column (the gradients at an x and z, for the y below and above) boils down to
+// The numbers we need from a lattice corner column (the two gradients at an x and z, one for each y)
 struct CornerColumn {
     float slopeX;   // the gradients' x, mixed by the y fade
     float slopeZ;   // the same for z
@@ -690,8 +690,8 @@ DEV CornerColumn pickColumn(const CornerColumn (&columns)[ColumnCount], int whic
  */
 DEV void checkTemperatureBands(uint64_t index, const uint64_t *slices0, const uint64_t *slices1, HalfHeader header0, HalfHeader header1,
                                uint64_t *evenBuilt, uint64_t *evenIndexes, uint32_t *evenCount) {
-    // The first half's grid always covers 2 lattice cells on a side. The second half's grid can reach a third cell when it starts
-    // right at the end of a cell, and those seeds go on to the full check
+    // The first half's grid covers 2 lattice cells on a side. The second half's grid can reach a third cell when it starts right
+    // at the end of a cell, and we send those seeds on to the full check
     CornerColumn columns0[3][3], columns1[3][3];
 #pragma unroll
     for (int x = 0; x < 3; x++) {
@@ -703,8 +703,8 @@ DEV void checkTemperatureBands(uint64_t index, const uint64_t *slices0, const ui
     }
 
     // The rest of this runs on the float pipes, since the shuffle keeps the ALU pipe busy. Picking between cells is a blend with a
-    // weight of 0 or 1, and a band count adds saturate((temperature - edge) * 10^5 + 0.5). That's 0 or 1 unless the sample is right
-    // next to the edge, then the count has a fraction and the seed goes on to the full check
+    // weight of 0 or 1, and a band adds saturate((temperature - edge) * 10^5 + 0.5) to atLeast. That's a whole number when the
+    // sample isn't right next to the edge. If it is, the seed goes on to the full check
     float columnFraction0[9], columnFade0[9], columnFraction1[9], columnFade1[9];
     float firstInCell0 = 9, firstInCell1 = 9; // the first column in the second cell
     bool wide = false;                        // the second half reaches a third cell
@@ -818,7 +818,7 @@ DEV void checkTemperatureBands(uint64_t index, const uint64_t *slices0, const ui
 }
 
 /**
- * @brief This kernel builds both temperature halves (two shuffles in one loop) and takes a first look at the bands. The seeds
+ * @brief This kernel shuffles the temperature halves together in a single loop and takes a first look at the bands. The seeds
  * that could pass temperatureKernel go to evenIndexes, with their corner slices in evenBuilt (at their slot, like built)
  *
  * @param indexes The stream indexes
@@ -978,9 +978,9 @@ probeKernel(const uint64_t *seeds, const double *probeScores, int seedCount, uin
         float mean = 0, squareSum = 0;
         float lowestValue = 1e9f, highestValue = -1e9f;
         uint64_t binsLow = 0, binsHigh = 0;
-        // The octaves are shuffled already, and the thread's table words are free until the next climate value. They hold the
-        // slope and constant for the x edges of a row (edge e at words 2e and 2e + 1). The lowest octave's edges come first, then
-        // the second octave's. A half's grid can touch side + 1 edges, firstEdge leaves room for all of them
+        // The octaves are shuffled already, and the thread's table words are free until the next climate value. We use them to
+        // keep the slope and constant for the x edges of a row, two words for an edge. The lowest octave's edges go first, then
+        // the second octave's, and firstEdge leaves room for all side + 1 edges of a half
         uint32_t *scratch = tableWords + threadIdx.x;
 #pragma unroll 1
         for (int row = 0; row < 9; row++) {
@@ -2277,7 +2277,7 @@ static void uploadHighValueCutoffs() {
     double temperatureEvenness = 0.980;
     double temperatureScore = 2.0;
     double cellScore = 2.0;
-    double probeThreshold = 12.0; // this loses one of the known seeds over ARBITRATIONS 86, and none over 87
+    double probeThreshold = 12.0; // we lose a single known seed bigger than ARBITRATIONS 86 with this, and none bigger than 87
     double rankThresholds[5];
     double deepCutoffs[2] = {51.918, 52.918};
     cudaMemcpyFromSymbol(rankThresholds, RANK_THRESHOLD, sizeof(rankThresholds)); // level 1 keeps its cutoff
@@ -2649,11 +2649,13 @@ static GateHelper *gateHelper = NULL;   // The CPU threads helping the GPU gate 
 static long completeBatch(BatchSlot &batch, std::vector<CascadeResult> &hostResults, std::vector<uint64_t> &hostSeeds, ScanResults &results,
                           long finishedBefore) {
     cudaStreamSynchronize(batch.stream);
-    uint32_t counts[3]; // the gate's count, the last group's even count and the even seeds that didn't fit
+    uint32_t counts[3]; // gatedCount, then the two words of evenCount (the second one counts the even seeds that didn't fit)
     cudaMemcpy(counts, batch.gatedCount, sizeof(counts), cudaMemcpyDeviceToHost);
     if (counts[2]) {
-        fprintf(stderr, "The even seed buffer was full! %u seeds didn't get the whole temperature check\n", counts[2]);
-        cudaMemset(batch.evenCount + 1, 0, 4);
+        // Those seeds never got checked, so the checkpoint can't move past them
+        fprintf(stderr, "The even seed buffer was full! %u seeds didn't get the whole temperature check, stopping without saving the checkpoint!\n",
+                counts[2]);
+        exit(1);
     }
     if (gpuGate) {
         uint32_t gated = counts[0];
@@ -3023,7 +3025,7 @@ static bool readRange(const std::vector<const char *> &words, const Settings &se
             printf("The range in the checkpoint is done, starting the next one from %llu...\n", (unsigned long long) start);
         }
     } else {
-        // Without a count the range is as big as it can be, and it goes until it gets stopped
+        // If you don't give it a COUNT the range is as big as possible, and it keeps going until you stop it
         unsigned long long startValue = 0, countValue = (unsigned long long) MAX_RANGE_SIZE;
         if (carryOn) {
             printf("There's no checkpoint yet, so this starts at index 0\n");
@@ -3389,7 +3391,7 @@ int main(int argc, char **argv) {
     cudaEventRecord(startEvent);
 
     // The batches run together, each with a seperate stream and buffers.
-    // They finish in the order they started, finished never counts a batch the GPU is still working on
+    // Batches finish in the order they started, so finished doesn't include a batch the GPU is working on
     std::vector<BatchSlot> batches(settings.streams);
     for (int i = 0; i < settings.streams; i++) {
         if (!allocateBatchSlot(batches[i], settings.cpuAssist)) {

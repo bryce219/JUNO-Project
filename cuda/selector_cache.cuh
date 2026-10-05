@@ -130,7 +130,7 @@ __constant__ int32_t PIPE_MINUS_ONE = -1;
 __constant__ uint32_t PIPE_QUARTER = 1u << 30;
 
 // A thread's array is a column of words with 4 entries in a word, and the words are TABLE_THREADS apart. That way the lanes of
-// a warp hit their own banks, and the shuffle can store a word of finished entries in a single write
+// a warp hit different banks, and the shuffle can save a word of finished entries in a single store
 DEV uint8_t *tableStart(uint32_t *tableWords) {
     return (uint8_t *) (tableWords + threadIdx.x);
 }
@@ -192,8 +192,8 @@ DEV void shuffleTable(uint8_t *table, XoroshiroState random) {
     split.highLow = (uint32_t) random.high;
     split.highHigh = (uint32_t) (random.high >> 32);
 
-    // Entry i is finished when step i swaps it, and nothing reads it again in this shuffle. A step just writes the entry it swaps
-    // with, and the finished entries get stored a word at a time
+    // Entry i is finished when step i swaps it, nothing looks at it again in this shuffle. That means a step only has to update
+    // the entry it swaps with, and we save the finished entries a word at a time
     uint8_t *row = table; // entry i
 #pragma unroll 1
     for (int i = 0; i < 256; i += 16, row += 16 * TABLE_THREADS) {
@@ -339,7 +339,7 @@ DEV void shuffleTwoTables(uint8_t *table0, uint8_t *table1, XoroshiroState rando
 }
 
 /**
- * @brief Builds the octave for the halves of a climate value at once, like buildHalf does for a single half. All of the
+ * @brief Gets the octave ready for the halves of a climate value together, like buildHalf does for a single half. All of the
  * block's threads have to call this (it resets all of the array slots)
  *
  * @param tableWords The block's shared arrays

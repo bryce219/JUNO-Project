@@ -191,7 +191,7 @@ static inline __m512i halfTermVectors(int climate, int half, __m512i first, __m5
 #define QUEUE_SIZE 4096 // How many indexes go through the gate together
 
 size_t gateIndexes(GateCuts cuts, uint64_t firstIndex, size_t indexCount, uint64_t *output) {
-    // The seeds that are left after a stage: the index, the seed's random numbers, the humidity generator and the total so far
+    // The seeds left from the last stage: the index, the seed's random numbers, the humidity generator and the current total
     static __thread uint64_t queueIndexes[QUEUE_SIZE + 16], queueLows[QUEUE_SIZE + 16], queueHighs[QUEUE_SIZE + 16];
     static __thread uint64_t queueClimateLows[QUEUE_SIZE + 16], queueClimateHighs[QUEUE_SIZE + 16], queueTotals[QUEUE_SIZE + 16];
     const __m512i lanes = _mm512_set_epi64(7, 6, 5, 4, 3, 2, 1, 0);
@@ -268,7 +268,7 @@ size_t gateIndexes(GateCuts cuts, uint64_t firstIndex, size_t indexCount, uint64
             __m512i totals = _mm512_add_epi64(_mm512_loadu_si512(queueTotals + j), halfTermVectors(0, 1, first, second));
             __mmask8 keep = _mm512_cmple_epu64_mask(totals, humidityCut);
             if (keep) {
-                // kept can't get ahead of j, this writes over groups we already read
+                // kept can't get ahead of j, we only overwrite groups we've read
                 _mm512_storeu_si512(queueIndexes + kept, _mm512_maskz_compress_epi64(keep, _mm512_loadu_si512(queueIndexes + j)));
                 _mm512_storeu_si512(queueLows + kept, _mm512_maskz_compress_epi64(keep, _mm512_loadu_si512(queueLows + j)));
                 _mm512_storeu_si512(queueHighs + kept, _mm512_maskz_compress_epi64(keep, _mm512_loadu_si512(queueHighs + j)));
@@ -329,7 +329,7 @@ int gateLanes(void) {
 }
 #elif defined(__AVX2__)
 // The AVX2 version of the gate, it checks a vector of indexes in one go. AVX2 doesn't have the rotates, the long multiply or
-// the compress the AVX-512 version uses, and this builds them out of the instructions it does have
+// the compress from the AVX-512 version, and we make them out of the instructions it has
 #include <immintrin.h>
 
 #define BROADCAST(value) _mm256_set1_epi64x((long long) (value))
@@ -405,8 +405,11 @@ static inline int passingLanes(__m256i totals, __m256i cut) {
     return ~_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpgt_epi64(totals, cut))) & 15;
 }
 
-// The compress from the AVX-512 version, as a permute. moves[lanes] packs the lanes in lanes to the front
-static void loadCompressMoves(__m256i moves[16]) {
+// The compress from the AVX-512 version, as a permute. compressMoves[lanes] packs the lanes in lanes to the front, and
+// loadCompressMoves fills it in when the program starts
+static __m256i compressMoves[16];
+
+__attribute__((constructor)) static void loadCompressMoves(void) {
     for (int lanes = 0; lanes < 16; lanes++) {
         int32_t words[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         int slot = 0;
@@ -416,7 +419,7 @@ static void loadCompressMoves(__m256i moves[16]) {
                 words[slot++] = lane + lane + 1;
             }
         }
-        moves[lanes] = _mm256_loadu_si256((const __m256i *) words);
+        compressMoves[lanes] = _mm256_loadu_si256((const __m256i *) words);
     }
 }
 
@@ -431,15 +434,13 @@ static inline __m256i loadVector(const uint64_t *source) {
 #define QUEUE_SIZE 4096 // How many indexes go through the gate together
 
 size_t gateIndexes(GateCuts cuts, uint64_t firstIndex, size_t indexCount, uint64_t *output) {
-    // The seeds that are left after a stage: the index, the seed's random numbers, the humidity generator and the total so far
+    // The seeds left from the last stage: the index, the seed's random numbers, the humidity generator and the current total
     static __thread uint64_t queueIndexes[QUEUE_SIZE + 8], queueLows[QUEUE_SIZE + 8], queueHighs[QUEUE_SIZE + 8];
     static __thread uint64_t queueClimateLows[QUEUE_SIZE + 8], queueClimateHighs[QUEUE_SIZE + 8], queueTotals[QUEUE_SIZE + 8];
     const __m256i lanes = _mm256_set_epi64x(3, 2, 1, 0);
     const __m256i firstHalfCut = BROADCAST(cuts.firstHalf);
     const __m256i humidityCut = BROADCAST(cuts.humidity);
     const __m256i totalCut = BROADCAST(cuts.total);
-    __m256i moves[16];
-    loadCompressMoves(moves);
 
     size_t passCount = 0;
     size_t i = 0;
@@ -478,12 +479,12 @@ size_t gateIndexes(GateCuts cuts, uint64_t firstIndex, size_t indexCount, uint64
             int passed = passingLanes(totals, firstHalfCut);
             if (passed) {
                 __m256i indexes = _mm256_add_epi64(BROADCAST(firstIndex + i), lanes);
-                storeCompressed(queueIndexes + queued, indexes, moves[passed]);
-                storeCompressed(queueLows + queued, seedLow, moves[passed]);
-                storeCompressed(queueHighs + queued, seedHigh, moves[passed]);
-                storeCompressed(queueClimateLows + queued, low, moves[passed]);
-                storeCompressed(queueClimateHighs + queued, high, moves[passed]);
-                storeCompressed(queueTotals + queued, totals, moves[passed]);
+                storeCompressed(queueIndexes + queued, indexes, compressMoves[passed]);
+                storeCompressed(queueLows + queued, seedLow, compressMoves[passed]);
+                storeCompressed(queueHighs + queued, seedHigh, compressMoves[passed]);
+                storeCompressed(queueClimateLows + queued, low, compressMoves[passed]);
+                storeCompressed(queueClimateHighs + queued, high, compressMoves[passed]);
+                storeCompressed(queueTotals + queued, totals, compressMoves[passed]);
                 queued += (size_t) __builtin_popcount((unsigned) passed);
             }
         }
@@ -512,11 +513,11 @@ size_t gateIndexes(GateCuts cuts, uint64_t firstIndex, size_t indexCount, uint64
             __m256i totals = _mm256_add_epi64(loadVector(queueTotals + j), halfTermVectors(0, 1, first, second));
             int passed = passingLanes(totals, humidityCut);
             if (passed) {
-                // kept can't get ahead of j, this writes over groups we already read
-                storeCompressed(queueIndexes + kept, loadVector(queueIndexes + j), moves[passed]);
-                storeCompressed(queueLows + kept, loadVector(queueLows + j), moves[passed]);
-                storeCompressed(queueHighs + kept, loadVector(queueHighs + j), moves[passed]);
-                storeCompressed(queueTotals + kept, totals, moves[passed]);
+                // kept can't get ahead of j, we only overwrite groups we've read
+                storeCompressed(queueIndexes + kept, loadVector(queueIndexes + j), compressMoves[passed]);
+                storeCompressed(queueLows + kept, loadVector(queueLows + j), compressMoves[passed]);
+                storeCompressed(queueHighs + kept, loadVector(queueHighs + j), compressMoves[passed]);
+                storeCompressed(queueTotals + kept, totals, compressMoves[passed]);
                 kept += (size_t) __builtin_popcount((unsigned) passed);
             }
         }
@@ -546,11 +547,11 @@ size_t gateIndexes(GateCuts cuts, uint64_t firstIndex, size_t indexCount, uint64
                 }
                 int passed = passingLanes(totals, totalCut);
                 if (passed) {
-                    storeCompressed(queueIndexes + kept, loadVector(queueIndexes + j), moves[passed]);
+                    storeCompressed(queueIndexes + kept, loadVector(queueIndexes + j), compressMoves[passed]);
                     if (climate == 1) {
-                        storeCompressed(queueLows + kept, seedLow, moves[passed]);
-                        storeCompressed(queueHighs + kept, seedHigh, moves[passed]);
-                        storeCompressed(queueTotals + kept, totals, moves[passed]);
+                        storeCompressed(queueLows + kept, seedLow, compressMoves[passed]);
+                        storeCompressed(queueHighs + kept, seedHigh, compressMoves[passed]);
+                        storeCompressed(queueTotals + kept, totals, compressMoves[passed]);
                     }
                     kept += (size_t) __builtin_popcount((unsigned) passed);
                 }

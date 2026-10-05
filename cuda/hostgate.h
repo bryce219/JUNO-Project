@@ -51,7 +51,7 @@ typedef struct {
  */
 size_t gateIndexes(GateCuts cuts, uint64_t firstIndex, size_t indexCount, uint64_t *output);
 
-// Returns how many seeds the CPU gate checks at a time (this is bigger with AVX-512)
+// Returns how many seeds the CPU gate checks at a time (8 with AVX-512, 4 with AVX2, 1 without either)
 int gateLanes(void);
 
 #ifdef __cplusplus
